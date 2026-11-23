@@ -1,0 +1,17 @@
+[
+  { "label": "EC2 default (t4g.nano, Compute Savings 3yr)", "args": ["--service", "ec2", "--region", "us-east-2"] },
+  { "label": "EC2 m5.large x2 On-Demand", "args": ["--service", "ec2", "--region", "us-east-2", "--set", "pricingStrategy=on-demand", "--set", "instanceType=m5.large", "--set", "instances=2"] },
+  { "label": "EC2 m5.large Windows", "args": ["--service", "ec2", "--region", "us-east-2", "--set", "pricingStrategy=on-demand", "--set", "instanceType=m5.large", "--set", "selectedOS=windows"] },
+  { "label": "EC2 t4g.nano Spot", "args": ["--service", "ec2", "--region", "us-east-2", "--set", "pricingStrategy=spot"] },
+  { "label": "RDS MySQL db.m4.10xlarge Multi-AZ", "args": ["--service", "rds-mysql", "--region", "us-east-1", "--set", "instanceType=db.m4.10xlarge", "--set", "deployment=Multi-AZ"] },
+  { "label": "RDS MySQL Reserved 1yr All Upfront", "args": ["--service", "rds-mysql", "--region", "us-east-1", "--set", "instanceType=db.t3.micro", "--set", "deployment=Single-AZ", "--set", "pricingModel=Reserved", "--set", "term=1yr", "--set", "purchaseOption=All"] },
+  { "label": "RDS PostgreSQL defaults", "args": ["--service", "rds-postgresql", "--region", "us-east-1"] },
+  { "label": "Aurora PostgreSQL + 100 GB", "args": ["--service", "aurora-postgresql", "--region", "us-east-1", "--set", "storageAmount=100GB"] },
+  { "label": "DocumentDB db.r5.large", "args": ["--service", "documentdb", "--region", "us-east-1", "--set", "nodes=1", "--set", "instanceType=db.r5.large"] },
+  { "label": "Neptune 100 GB", "args": ["--service", "neptune", "--region", "us-east-1", "--set", "Neptune_storageAmount=100GB", "--set", "nodes=1", "--set", "instanceType=db.r5.large"] },
+  { "label": "MemoryDB 2 nodes", "args": ["--service", "memorydb", "--region", "us-east-1", "--set", "Data_Written=1GB", "--set", "Mdb_BackupStorage=1GB", "--set", "nodes=2", "--set", "instanceType=db.r6g.large"] },
+  { "label": "ElastiCache 2 x cache.t3.micro", "args": ["--service", "elasticache", "--region", "us-east-1", "--set", "nodes2=2", "--set", "instanceType2=cache.t3.micro", "--set", "engine2=Redis", "--set", "pricingModel2=OnDemand"] },
+  { "label": "OpenSearch defaults", "args": ["--service", "opensearch", "--region", "us-east-1"] },
+  { "label": "MSK defaults", "args": ["--service", "msk", "--region", "us-east-1"] },
+  { "label": "Direct Connect default port", "args": ["--service", "direct-connect", "--region", "us-east-1"] }
+]

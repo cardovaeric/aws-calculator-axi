@@ -255,9 +255,15 @@ Use `--refresh` to bypass the cache or `--offline` to require it.
 ## Development
 
 ```sh
-npm test          # unit + offline end-to-end + fast-path latency tests
-npm link          # expose `awscalc`
+npm test                     # unit + offline end-to-end + fast-path latency tests
+npm run verify:calculator    # publish + browser recompute parity checks
+npm link                     # expose `awscalc`
 ```
+
+`npm run verify:calculator` needs `agent-browser` and a browser. It publishes a
+corpus of estimates, opens each URL, clicks **Update estimate**, and fails if the
+recomputed total differs. The backend endpoint map and state shapes are in
+[docs/API-MAP.md](docs/API-MAP.md).
 
 The validation workflow used while developing lives outside the test suite because it needs a browser and the live calculator: publish with `--share`, open the URL, click **Update estimate**, and compare the recomputed total.
 

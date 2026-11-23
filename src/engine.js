@@ -585,7 +585,7 @@ export class Engine {
         "UNSUPPORTED_SERVICE",
         [
           "Use `--set workloadSelection=consistent` (constant usage)",
-          "Daily/weekly/monthly spike workloads are not implemented",
+          "Spike workloads need the calculator's savings/on-demand cost optimizer",
         ],
       );
     }
@@ -594,6 +594,8 @@ export class Engine {
         workloadComponent?.defaultValue ??
         1,
     );
+    const totalHours = instances * 730;
+    const workloadData = { workloadType, data: String(instances) };
 
     const strategyText =
       consume(strategyComponent)?.text ??
@@ -655,7 +657,7 @@ export class Engine {
       : cheapestEc2Instance(indexData, context.display);
     const instanceType = instanceEntry["Instance Type"];
     const onDemandRate = Number(instanceEntry.price) || 0;
-    const totalHours = instances * 730;
+
 
     let savingsRate = null;
     let spotDiscount = 0;
@@ -704,26 +706,27 @@ export class Engine {
 
     const spotCost =
       strategy === "spot"
-        ? roundHalfUp(
-            onDemandRate * totalHours * (1 - spotDiscount / 100),
-            2,
-          )
+        ? onDemandRate * totalHours * (1 - spotDiscount / 100)
         : 0;
+    const coveredInstances = Math.floor(totalHours / 730);
+    const coveredHours = coveredInstances * 730;
+    const uncoveredHours = totalHours - coveredHours;
+    const savingsCoveredCost =
+      coveredHours * (savingsRate ?? onDemandRate);
+    const uncoveredOnDemandCost = uncoveredHours * onDemandRate;
     const costs = {
       onDemandCost:
         strategy === "on-demand"
-          ? roundHalfUp(onDemandRate * totalHours, 2)
-          : spotCost,
+          ? onDemandRate * totalHours
+          : strategy === "spot"
+            ? spotCost
+            : uncoveredOnDemandCost,
       upfrontCost: 0,
       monthlyCost: 0,
       instanceSavingsCost:
-        strategy === "instance-savings"
-          ? roundHalfUp(savingsRate * totalHours, 2)
-          : 0,
+        strategy === "instance-savings" ? savingsCoveredCost : 0,
       computeSavingsCost:
-        strategy === "compute-savings"
-          ? roundHalfUp(savingsRate * totalHours, 2)
-          : 0,
+        strategy === "compute-savings" ? savingsCoveredCost : 0,
       totalHours,
     };
     this.values.set("totalHours", totalHours);
@@ -746,22 +749,25 @@ export class Engine {
             selectedOption: "spot",
             spotDiscountPercentage: String(spotDiscount),
           }
-        : {
-            selectedOption: strategy,
-            term: `${term} Year`,
-            upfrontPayment:
-              purchaseOption === "No Upfront" ? "None" : purchaseOption,
-            model:
-              strategy === "on-demand"
-                ? "onDemand"
-                : strategy === "instance-savings"
+        : strategy === "on-demand"
+          ? {
+              selectedOption: "on-demand",
+              term: "1 year",
+              utilizationValue: "100",
+              utilizationUnit: "%Utilized/Month",
+            }
+          : {
+              selectedOption: strategy,
+              term: `${term} Year`,
+              upfrontPayment:
+                purchaseOption === "No Upfront" ? "None" : purchaseOption,
+              model:
+                strategy === "instance-savings"
                   ? "instanceSavings"
                   : "computeSavings",
-          };
+            };
     if (workloadComponent) {
-      this.rawInputs.set(workloadComponent.id, {
-        value: { workloadType, data: String(instances) },
-      });
+      this.rawInputs.set(workloadComponent.id, { value: workloadData });
       this.handledComponents.add(workloadComponent.id);
     }
     if (workloadSelection) {
@@ -793,7 +799,10 @@ export class Engine {
     this.summary.push({
       id: "workload",
       label: "Workload",
-      text: `Workload (Consistent, Number of instances: ${instances})`,
+      text:
+        workloadType === "consistent"
+          ? `Workload (Consistent, Number of instances: ${instances})`
+          : `Workload (${workloadType[0].toUpperCase()}${workloadType.slice(1)}, Baseline: ${baseline}, Peak: ${peak}, Duration of peak: ${peakDays} Day ${peakHours} Hr ${peakMinutes} Min)`,
     });
     this.summary.push({
       id: instanceComponent?.id ?? "instanceType",
