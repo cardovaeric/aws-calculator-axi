@@ -321,7 +321,7 @@ test("reports unsupported maths and input types instead of silently returning 0"
         title: "Main",
         inputSection: {
           components: [
-            { type: "input", subType: "ec2InstanceSearch", id: "table", label: "Table" },
+            { type: "input", subType: "priceSelector", id: "table", label: "Table" },
           ],
         },
         mathsSection: [],
@@ -334,5 +334,5 @@ test("reports unsupported maths and input types instead of silently returning 0"
       error instanceof AxiError && error.code === "UNSUPPORTED_SERVICE",
   );
   const surface = supportedSurface(def);
-  assert.deepEqual(surface.unsupportedInput, ["ec2InstanceSearch"]);
+  assert.deepEqual(surface.unsupportedInput, ["priceSelector"]);
 });

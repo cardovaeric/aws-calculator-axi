@@ -27,6 +27,12 @@ import {
   mappingDefinitionsFor,
 } from "./pricing.js";
 import { loadPlcContext } from "./plc.js";
+import {
+  cheapestEc2Instance,
+  loadEc2Context,
+  loadEc2Index,
+  selectEc2Aggregation,
+} from "./ec2.js";
 import { DEFAULT_REGION, REGION_NAMES, resolveRegion } from "./regions.js";
 import { recentForCwd, recordEstimate, readHistory } from "./store.js";
 import { VERSION } from "./version.js";
@@ -524,6 +530,67 @@ async function columnFormRows(component, definition, template, region, options, 
   return out;
 }
 
+async function ec2Rows(definition, template, region, options) {
+  const rows = [
+    {
+      id: "instances",
+      type: "ec2Workload",
+      default: "1",
+      values: "-",
+    },
+    {
+      id: "instanceType",
+      type: "ec2Instance",
+      default: "-",
+      values: "-",
+    },
+    {
+      id: "pricingStrategy",
+      type: "ec2Strategy",
+      default: "compute-savings",
+      values: "on-demand|compute-savings|instance-savings",
+    },
+    {
+      id: "term",
+      type: "ec2Strategy",
+      default: "3yr",
+      values: "1yr|3yr",
+    },
+    {
+      id: "upfront",
+      type: "ec2Strategy",
+      default: "None",
+      values: "None",
+    },
+    {
+      id: "workloadSelection",
+      type: "ec2Workload",
+      default: "consistent",
+      values: "consistent",
+    },
+  ];
+  try {
+    const context = await loadEc2Context({ region, ...options });
+    const selected = selectEc2Aggregation(context, {
+      tenancy: "Shared",
+      os: "Linux",
+      preInstalled: "NA",
+      termType: "OnDemand",
+    });
+    const { data } = await loadEc2Index(context, selected.aggregation, options);
+    const entries = Object.values(data.regions?.[context.display] ?? {});
+    const cheapest = cheapestEc2Instance(data, context.display);
+    rows[1].default = cheapest["Instance Type"];
+    rows[1].values = `${entries.length} instances available (e.g. ${entries
+      .slice(0, 5)
+      .map((entry) => entry["Instance Type"])
+      .join(", ")})`;
+  } catch {
+    rows[1].values = "any instance available in the selected region";
+  }
+  return rows;
+}
+
 async function serviceCommand(args) {
   const { flags, positionals } = parseFlags("service", args);
   if (positionals.length === 0) {
@@ -635,6 +702,14 @@ async function serviceCommand(args) {
       inputs.push(row);
     }
   }
+  const hasEc2 = (template.cards ?? []).some((card) =>
+    (card.inputSection?.components ?? []).some(
+      (component) => component.subType === "ec2InstanceSearch",
+    ),
+  );
+  if (hasEc2) {
+    inputs.push(...(await ec2Rows(definition, template, region, options)));
+  }
   let columnFormCount = 0;
   for (const card of template.cards ?? []) {
     for (const component of card.inputSection?.components ?? []) {
@@ -682,6 +757,11 @@ async function serviceCommand(args) {
         .filter((item) => item?.id)
         .map((item) => item.id)
         .join(", ")} — select with --template`,
+    );
+  }
+  if (hasEc2) {
+    help.push(
+      "EC2 supports constant workloads with On-Demand or Savings Plans; Reserved/Spot and spike workloads fail loudly",
     );
   }
   if (columnFormCount > 1) {

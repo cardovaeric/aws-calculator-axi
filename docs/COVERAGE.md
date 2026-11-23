@@ -7,21 +7,24 @@ what is still missing, and how each piece is validated.
 
 | Area | Covered |
 |---|---|
-| Top-level single services | **161 / 163** |
+| Top-level single services | **162 / 163** |
 | Grouped services | **33 / 33** |
 | Sub-services inside groups | **205 / 208** |
 | Standard AWS regions + Local/Wavelength zones | **116 codes** |
 | Per-service region availability | Checked from `regionList/publish.json` |
 | PLC 2.0 pricing (instance tables) | On-demand + Reserved (No/Partial/All Upfront) |
+| EC2 shared tenancy | On-Demand + Compute/Instance Savings Plans, EBS, monitoring |
 | `columnFormIPM` rows | Single row per table, indexed for multi-table services |
 
-Remaining top-level services that cannot be priced yet:
+Remaining top-level service that cannot be priced yet:
 
-1. **`ec2Enhancement` — Amazon EC2.** Needs `ec2InstanceSearch`,
-   `ec2AdvPricingStrategy*`, `ec2PriceFetcher`, `workload*`, and
-   Savings Plan/Reserved Instance selection.
-2. **`windowsWorkloads`.** Needs the Windows Server license/workload table,
+1. **`windowsWorkloads`.** Needs the Windows Server license/workload table,
    dedicated host tables, and `conditionalCheckboxes`/`uploadTable` widgets.
+
+EC2 itself is priceable for **shared tenancy** with On-Demand and Savings Plans
+(including EBS and detailed monitoring). EC2 dedicated/host tenancy, Reserved
+Instances, Spot, and daily/weekly/monthly spike workloads are rejected with
+`UNSUPPORTED_SERVICE` until implemented.
 
 Remaining grouped sub-services:
 
@@ -66,26 +69,30 @@ Validated so far:
 | ElastiCache | 2 × cache.t3.micro Redis OnDemand (table 2) | `$24.82/mo` exact |
 | OpenSearch | defaults | `$553.34/mo` exact |
 | MSK | 3 × express.m7g.large + 100 GB | `$923.52/mo` exact |
+| EC2 | default: t4g.nano, Linux, Compute Savings 3yr | `$1.53/mo` exact |
+| EC2 | m5.large ×2, Linux, On-Demand | `$140.16/mo` exact |
+| EC2 | m5.large, Windows, On-Demand | `$137.24/mo` exact |
+| EC2 | m5.large, SQL Server Standard, On-Demand | `$487.64/mo` exact |
+| EC2 | m5.large, RHEL, On-Demand | `$91.25/mo` exact |
+| EC2 | m5.large, EBS 100 GB gp3, detailed monitoring | `$80.18/mo` exact |
+| EC2 | m5.large ×2, Compute Savings 1yr No Upfront | `$103.66/mo` exact |
 | Lambda/S3/CloudFront/DynamoDB/Fargate/EBS/API Gateway | see README | exact |
 
 ## Remaining roadmap
 
-### Phase 2 — EC2
+### Phase 2 — EC2 (partially done)
 
-- `ec2InstanceSearch`: filter by vCPU, memory, architecture, current generation.
-- `ec2PriceFetcher`: on-demand, reserved, savings plan price lookup from the
-  `ec2-calc` PLC artifacts.
-- `workloadInstanceMath` / `workloadStorageMath`: instance-hour and storage
-  aggregation.
-- Region/instance availability from the EC2 aggregations (instance types differ
-  by region).
-- EBS and data transfer within EC2.
+- [x] `ec2InstanceSearch`: instance lookup with region/OS availability.
+- [x] `ec2PriceFetcher`: on-demand + Compute/Instance Savings Plans.
+- [x] Constant workload hours and EBS/monitoring cards.
+- [ ] Daily/weekly/monthly spike workload math.
+- [ ] EC2 Reserved Instances (standard/convertible) and Spot.
+- [ ] Dedicated/host tenancy and `dedicatedHostsMath`.
 
-### Phase 3 — EC2 commitments and Windows
+### Phase 3 — Windows workloads
 
-- `ec2AdvPricingStrategyMath` (Savings Plans, Reserved Instances, utilization).
-- `dedicatedHostsMath` and the dedicated host review/cost tables.
-- `windowsWorkloads` conditional checkboxes, SQL summary, workload price sets.
+- `conditionalCheckboxes`, Windows Server license table, SQL summary,
+  dedicated host review/cost tables, workload price sets.
 
 ### Phase 4 — remaining table/selector gaps
 

@@ -133,13 +133,14 @@ Validated by publishing an estimate and comparing the stored total with the calc
 
 The calculator publishes 441 service definitions. `awscalc` can price:
 
-- **161 of 163 top-level single services**
+- **162 of 163 top-level single services**
 - **33 of 33 grouped services**, with **205 of 208 sub-services**
 - PLC 2.0 instance tables (RDS family, Aurora, ElastiCache, OpenSearch, MSK, Neptune, DocumentDB, Redshift, Keyspaces, MemoryDB, …) including **Reserved Instances** (No/Partial/All Upfront)
+- **EC2 shared tenancy** with On-Demand, Compute Savings Plans, and Instance Savings Plans, plus EBS and detailed monitoring
 
 Still missing:
 
-- **Amazon EC2** (`ec2InstanceSearch`, `ec2PriceFetcher`, workload/Savings Plan widgets)
+- **EC2 dedicated/host tenancy, Reserved Instances, Spot, and daily/weekly/monthly spike workloads**
 - **Windows workloads** on EC2 (dedicated host and SQL Server license tables)
 - **WorkSpaces Personal / Thin Client / Secure Browser** monthly pricing shape
 - Direct Connect port monthly price override
@@ -149,6 +150,37 @@ Still missing:
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the full status and roadmap.
 
 Run `awscalc services` for the catalog and `awscalc service <code>` for a service's supported inputs. Grouped services list their sub-services and which ones are in the calculator default.
+
+## EC2
+
+EC2 uses its own instance catalog and savings-plan artifacts:
+
+```sh
+# Defaults match the calculator UI: cheapest current-generation instance,
+# Linux, Compute Savings Plans 3yr No Upfront
+awscalc price --service ec2 --region us-east-2 --share
+
+# On-Demand with a chosen instance and count
+awscalc price --service ec2 --region us-east-2 \
+  --set pricingStrategy=on-demand \
+  --set instanceType=m5.large \
+  --set instances=2 --share
+
+# Windows, SQL Server, RHEL, Ubuntu Pro, ...
+awscalc price --service ec2 --region us-east-2 \
+  --set selectedOS=windows-std \
+  --set instanceType=m5.large \
+  --set pricingStrategy=on-demand
+
+# EBS and detailed monitoring
+awscalc price --service ec2 --region us-east-2 \
+  --set instanceType=m5.large \
+  --set storageType="Storage General Purpose gp3 GB Mo" \
+  --set storageAmount=100GB \
+  --set detailedMonitoringCheckbox=true
+```
+
+Selectors: `instanceType`, `instances`, `pricingStrategy` (`on-demand`, `compute-savings`, `instance-savings`), `term` (`1yr`/`3yr`), `upfront` (`None`), `workloadSelection` (`consistent`). Unsupported EC2 modes (dedicated/host, Reserved Instances, Spot, spike workloads) fail with `UNSUPPORTED_SERVICE` rather than mispricing.
 
 ## PLC 2.0 services (RDS, Aurora, ElastiCache, MSK, …)
 

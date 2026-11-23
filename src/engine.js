@@ -18,6 +18,18 @@ import {
   loadPlcIndex,
   selectAggregation,
 } from "./plc.js";
+import {
+  cheapestEc2Instance,
+  EC2_OS_LABELS,
+  EC2_TENANCY_LABELS,
+  ec2OsSelection,
+  extractEc2SavingsRate,
+  findEc2Instance,
+  loadEc2Context,
+  loadEc2Index,
+  loadEc2SavingsIndex,
+  selectEc2Aggregation,
+} from "./ec2.js";
 
 const SUPPORTED_MATH = new Set([
   "basicMaths",
@@ -26,6 +38,7 @@ const SUPPORTED_MATH = new Set([
   "maxMin",
   "tieredPricingMath",
   "snapShotMaths",
+  "ec2AdvPricingStrategyMath",
 ]);
 
 const SUPPORTED_PRICING = new Set([
@@ -34,6 +47,7 @@ const SUPPORTED_PRICING = new Set([
   "tieredPricing",
   "replace",
   "concatenate",
+  "ec2PriceFetcher",
 ]);
 
 const SUPPORTED_INPUT = new Set([
@@ -51,6 +65,11 @@ const SUPPORTED_INPUT = new Set([
   "headerText",
   "condition",
   "columnFormIPM",
+  "radioTiles",
+  "workload",
+  "ec2InstanceSearch",
+  "ec2AdvPricingStrategyV2",
+  "ec2AdvPricingMetrics",
 ]);
 
 const NON_VALUE_INPUT = new Set([
@@ -102,6 +121,22 @@ function normalizePurchaseOption(option) {
   if (text.includes("partial")) return "Partial Upfront";
   if (text.includes("no")) return "No Upfront";
   return String(option ?? "");
+}
+
+function normalizeEc2Strategy(text) {
+  const value = String(text ?? "").toLowerCase();
+  if (value.includes("on-demand") || value.includes("ondemand")) return "on-demand";
+  if (value.includes("compute")) return "compute-savings";
+  if (value.includes("instance")) return "instance-savings";
+  if (value.includes("spot")) return "spot";
+  if (value.includes("convertible")) return "convertible";
+  if (value.includes("standard")) return "standard";
+  return "compute-savings";
+}
+
+function normalizeEc2Term(text) {
+  const value = String(text ?? "").toLowerCase();
+  return /1/.test(value) ? 1 : 3;
 }
 
 function maybeNumber(value) {
@@ -232,6 +267,7 @@ export class Engine {
     this.summary = [];
     this.trace = [];
     this.usedComponents = new Set();
+    this.handledComponents = new Set();
   }
 
   get units() {
@@ -392,15 +428,25 @@ export class Engine {
   async resolveInputs(overrides = {}) {
     const seenOverrides = new Set();
     let columnIndex = 0;
-    const hasColumnForm = this.cards().some((card) =>
-      (card.inputSection?.components ?? []).some(
-        (component) => component.subType === "columnFormIPM",
-      ),
+    const allComponents = this.cards().flatMap(
+      (card) => card.inputSection?.components ?? [],
     );
+    const hasColumnForm = allComponents.some(
+      (component) => component.subType === "columnFormIPM",
+    );
+    const hasEc2 = allComponents.some(
+      (component) =>
+        component.subType === "ec2InstanceSearch" ||
+        component.subType === "ec2PriceFetcher",
+    );
+    if (hasEc2) {
+      await this.resolveEc2(overrides, seenOverrides);
+    }
     for (const card of this.cards()) {
       if (!this.cardIsVisible(card)) continue;
       const components = card.inputSection?.components ?? [];
       for (const component of components) {
+        if (this.handledComponents.has(component.id)) continue;
         if (!this.evaluateCondition(component.displayIf, {})) continue;
         if (component.type === "pricing") {
           this.resolvePricing(component);
@@ -438,6 +484,10 @@ export class Engine {
           /^(?:instanceType|nodes|deployment|pricingModel|term|purchaseOption|utilization)\d*$/.test(
             id,
           )
+        ) &&
+        !(
+          hasEc2 &&
+          ["instanceType", "instances", "term", "upfront", "workload"].includes(id)
         ),
     );
     return { unknown };
@@ -449,6 +499,258 @@ export class Engine {
       ...(this.template.mappingDefinitions ?? []),
     ];
     return mappings.find((mapping) => mapping.mappingDefinitionName === name);
+  }
+
+  /** Resolve the EC2 instance/workload/pricing-strategy widgets. */
+  async resolveEc2(overrides, seenOverrides) {
+    const components = this.cards().flatMap(
+      (card) => card.inputSection?.components ?? [],
+    );
+    const bySubType = (subType) =>
+      components.find((component) => component.subType === subType);
+    const tenancyComponent = bySubType("dropdown") && this.findComponent("tenancy");
+    const osComponent = this.findComponent("selectedOS");
+    const workloadSelection = bySubType("radioTiles") ?? this.findComponent("workloadSelection");
+    const workloadComponent = bySubType("workload") ?? this.findComponent("workload");
+    const instanceComponent =
+      bySubType("ec2InstanceSearch") ?? this.findComponent("instanceType");
+    const strategyComponent =
+      bySubType("ec2AdvPricingStrategyV2") ?? this.findComponent("pricingStrategy");
+    const metricsComponent =
+      bySubType("ec2AdvPricingMetrics") ?? this.findComponent("ec2AdvancedPricingMetrics");
+    const fetcher = bySubType("ec2PriceFetcher");
+    const mathComponent = this.cards()
+      .flatMap((card) =>
+        (card.mathsSection ?? []).flatMap((group) => group.components ?? []),
+      )
+      .find((component) => component.subType === "ec2AdvPricingStrategyMath");
+
+    const consume = (component, aliases = []) => {
+      if (!component) return undefined;
+      for (const alias of [component.id, ...aliases]) {
+        if (overrides[alias] !== undefined) {
+          seenOverrides.add(alias);
+          return overrides[alias];
+        }
+      }
+      return undefined;
+    };
+
+    if (tenancyComponent) {
+      const provided = consume(tenancyComponent);
+      this.resolveInput(tenancyComponent, provided);
+      this.handledComponents.add(tenancyComponent.id);
+    }
+    if (osComponent) {
+      const provided = consume(osComponent);
+      this.resolveInput(osComponent, provided);
+      this.handledComponents.add(osComponent.id);
+    }
+
+    const tenancyValue = this.values.get("tenancy") ?? "shared";
+    const osValue = this.values.get("selectedOS") ?? "linux";
+    const tenancyLabel =
+      EC2_TENANCY_LABELS[tenancyValue] ??
+      String(tenancyValue).replace(/^./, (char) => char.toUpperCase());
+    const osOption = (osComponent?.options ?? []).find(
+      (option) => option.id === osValue,
+    );
+    const osLabel =
+      osOption?.label ?? EC2_OS_LABELS[osValue] ?? String(osValue);
+    const osSelection = ec2OsSelection(osValue, osLabel);
+
+    const workloadType =
+      consume(workloadSelection)?.text ??
+      workloadSelection?.defaultSelection ??
+      "consistent";
+    if (workloadType !== "consistent") {
+      throw new AxiError(
+        `EC2 workload "${workloadType}" is not supported yet`,
+        "UNSUPPORTED_SERVICE",
+        [
+          "Use `--set workloadSelection=consistent` (constant usage)",
+          "Daily/weekly/monthly spike workloads are not implemented",
+        ],
+      );
+    }
+    const instances = asNumber(
+      consume(workloadComponent, ["instances"])?.text ??
+        workloadComponent?.defaultValue ??
+        1,
+    );
+
+    const strategyText =
+      consume(strategyComponent)?.text ??
+      strategyComponent?.defaultValue ??
+      "compute-savings";
+    const termText =
+      overrides.term?.text ?? "3 Year";
+    const upfrontText =
+      overrides.upfront?.text ?? "None";
+    seenOverrides.add("term");
+    seenOverrides.add("upfront");
+
+    const strategy = normalizeEc2Strategy(strategyText);
+    if (strategy === "standard" || strategy === "convertible" || strategy === "spot") {
+      throw new AxiError(
+        `EC2 pricing strategy "${strategyText}" is not supported yet`,
+        "UNSUPPORTED_SERVICE",
+        [
+          "Use `--set pricingStrategy=on-demand`, `compute-savings`, or `instance-savings`",
+          "Reserved Instances and Spot pricing are not implemented",
+        ],
+      );
+    }
+    const term = normalizeEc2Term(termText);
+    const purchaseOption = normalizePurchaseOption(upfrontText);
+
+    const context = await loadEc2Context({
+      region: this.region,
+      currency: this.currency,
+      ...this.fetchOptions,
+    });
+    const selected = selectEc2Aggregation(context, {
+      tenancy: tenancyLabel,
+      os: osSelection.os,
+      preInstalled: osSelection.preInstalled,
+      termType: "OnDemand",
+    });
+    const { data: indexData } = await loadEc2Index(
+      context,
+      selected.aggregation,
+      this.fetchOptions,
+    );
+    const instanceProvided = consume(instanceComponent);
+    const instanceEntry = instanceProvided?.text
+      ? findEc2Instance(indexData, context.display, instanceProvided.text)
+      : cheapestEc2Instance(indexData, context.display);
+    const instanceType = instanceEntry["Instance Type"];
+    const onDemandRate = Number(instanceEntry.price) || 0;
+    const totalHours = instances * 730;
+
+    let savingsRate = null;
+    if (strategy === "compute-savings" || strategy === "instance-savings") {
+      if (purchaseOption !== "No Upfront") {
+        throw new AxiError(
+          `EC2 Savings Plans with ${purchaseOption} are not supported yet`,
+          "UNSUPPORTED_SERVICE",
+          ["Use `--set upfront=None` (No Upfront)"],
+        );
+      }
+      const savingsIndex = await loadEc2SavingsIndex(
+        context,
+        {
+          kind: strategy,
+          term,
+          purchaseOption,
+          os: osSelection.os,
+          preInstalled: osSelection.preInstalled,
+          tenancy: tenancyLabel,
+        },
+        this.fetchOptions,
+      );
+      savingsRate = extractEc2SavingsRate(savingsIndex, context.display, {
+        kind: strategy,
+        term,
+        purchaseOption,
+        instanceType,
+      });
+      if (savingsRate == null) {
+        throw new AxiError(
+          `No ${strategy} Savings Plan rate found for ${instanceType} in ${context.display}`,
+          "VALIDATION_ERROR",
+          ["Try --set pricingStrategy=on-demand"],
+        );
+      }
+    }
+
+    const costs = {
+      onDemandCost:
+        strategy === "on-demand"
+          ? roundHalfUp(onDemandRate * totalHours, 2)
+          : 0,
+      upfrontCost: 0,
+      monthlyCost: 0,
+      instanceSavingsCost:
+        strategy === "instance-savings"
+          ? roundHalfUp(savingsRate * totalHours, 2)
+          : 0,
+      computeSavingsCost:
+        strategy === "compute-savings"
+          ? roundHalfUp(savingsRate * totalHours, 2)
+          : 0,
+      totalHours,
+    };
+    this.values.set("totalHours", totalHours);
+    if (mathComponent) this.values.set(mathComponent.id, costs);
+    if (fetcher) {
+      this.handledComponents.add(fetcher.id);
+      this.pricingValues.set(fetcher.id, {
+        kind: "ec2PriceFetcher",
+        onDemandRate,
+        savingsRate,
+        instanceType,
+        instanceEntry,
+      });
+      this.values.set(fetcher.id, onDemandRate);
+    }
+
+    const strategyState = {
+      selectedOption: strategy,
+      term: `${term} Year`,
+      upfrontPayment: purchaseOption === "No Upfront" ? "None" : purchaseOption,
+      model:
+        strategy === "on-demand"
+          ? "onDemand"
+          : strategy === "instance-savings"
+            ? "instanceSavings"
+            : "computeSavings",
+    };
+    if (workloadComponent) {
+      this.rawInputs.set(workloadComponent.id, {
+        value: { workloadType, data: String(instances) },
+      });
+      this.handledComponents.add(workloadComponent.id);
+    }
+    if (workloadSelection) {
+      this.rawInputs.set(workloadSelection.id, { value: workloadType });
+      this.handledComponents.add(workloadSelection.id);
+    }
+    if (instanceComponent) {
+      this.rawInputs.set(instanceComponent.id, { value: instanceType });
+      this.handledComponents.add(instanceComponent.id);
+    }
+    if (strategyComponent) {
+      this.rawInputs.set(strategyComponent.id, { value: strategyState });
+      this.handledComponents.add(strategyComponent.id);
+    }
+    if (metricsComponent) {
+      this.values.set(metricsComponent.id, 1);
+      this.rawInputs.set(metricsComponent.id, { value: 1 });
+      this.handledComponents.add(metricsComponent.id);
+    }
+
+    const strategyLabel =
+      strategy === "on-demand"
+        ? "On-Demand"
+        : strategy === "instance-savings"
+          ? `EC2 Instance Savings Plans ${term}yr ${purchaseOption}`
+          : `Compute Savings Plans ${term}yr ${purchaseOption}`;
+    this.summary.push({
+      id: "workload",
+      label: "Workload",
+      text: `Workload (Consistent, Number of instances: ${instances})`,
+    });
+    this.summary.push({
+      id: instanceComponent?.id ?? "instanceType",
+      label: instanceComponent?.label ?? "Advance EC2 instance",
+      text: `${instanceComponent?.label ?? "Advance EC2 instance"} (${instanceType})`,
+    });
+    this.summary.push({
+      id: strategyComponent?.id ?? "pricingStrategy",
+      label: strategyComponent?.label ?? "Pricing strategy",
+      text: `Pricing strategy (${strategyLabel})`,
+    });
   }
 
   /** Resolve a columnFormIPM instance table row via the PLC 2.0 price index. */
@@ -1498,6 +1800,9 @@ export class Engine {
   }
 
   evaluateMath(component) {
+    if (component.subType === "ec2AdvPricingStrategyMath") {
+      return this.values.get(component.id) ?? {};
+    }
     if (!SUPPORTED_MATH.has(component.subType)) {
       throw new AxiError(
         `${this.definition.serviceName?.trim() ?? "This service"} uses calculation feature "${component.subType}", which awscalc cannot model yet`,
@@ -1665,12 +1970,23 @@ export class Engine {
       for (const component of [
         ...(card.mathsSection ?? []).flatMap((group) => group.components ?? []),
       ]) {
-        if (component.subType !== "priceDisplay") continue;
+        if (
+          component.subType !== "priceDisplay" &&
+          component.subType !== "ec2PriceDisplay"
+        ) {
+          continue;
+        }
         if (!this.evaluateCondition(component.displayIf, {})) continue;
-        const amount = asNumber(
-          this.values.get(component.subTotalRefer) ??
-            this.operandValue({ variableId: component.subTotalRefer }),
-        );
+        let amount;
+        if (component.subType === "ec2PriceDisplay") {
+          const source = this.values.get(component.refer);
+          amount = asNumber(source?.[component.path]);
+        } else {
+          amount = asNumber(
+            this.values.get(component.subTotalRefer) ??
+              this.operandValue({ variableId: component.subTotalRefer }),
+          );
+        }
         this.costLines.push({
           id: component.id,
           label: component.label ?? "Cost",
