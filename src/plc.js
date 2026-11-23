@@ -155,7 +155,7 @@ function normalizePurchaseOption(option) {
 export function extractPrices(
   index,
   display,
-  { termType = "OnDemand", term, purchaseOption } = {},
+  { termType = "OnDemand", term, purchaseOption, pricingUnitModel, calculationId } = {},
   rows,
 ) {
   const region =
@@ -222,16 +222,36 @@ export function extractPrices(
       ],
     );
   }
-  const hourly = Number(
-    hourlyEntries[hourlyEntries.length - 1]?.price ?? 0,
-  );
+  let hourly = Number(hourlyEntries[hourlyEntries.length - 1]?.price ?? 0);
   const upfront = Number(
     upfrontEntries[upfrontEntries.length - 1]?.price ?? 0,
   );
+  let perUnit = Number(perUnitEntry?.price ?? 0) || 0;
+
+  // Some tables expose a monthly per-unit rate instead of an hourly rate
+  // (Direct Connect ports, WorkSpaces Core bundles).
+  const hourlyOverride =
+    pricingUnitModel?.riPricingTypes?.hourly?.[0]?.$overridePriceKeyWith;
+  const countlyOverride =
+    pricingUnitModel?.riPricingTypes?.countly?.[0]?.$overridePriceKeyWith;
+  if (hourlyOverride) {
+    const entry = candidates.find((item) => item[hourlyOverride] != null);
+    if (entry) {
+      const value = Number(entry[hourlyOverride]);
+      if (Number.isFinite(value)) hourly = value;
+    }
+  }
+  if (countlyOverride) {
+    const entry = candidates.find((item) => item[countlyOverride] != null);
+    if (entry) {
+      const value = Number(entry[countlyOverride]);
+      if (Number.isFinite(value)) perUnit = value;
+    }
+  }
   return {
     hourly: Number.isFinite(hourly) ? hourly : 0,
     upfront: Number.isFinite(upfront) ? upfront : 0,
-    perUnit: Number(perUnitEntry?.price ?? 0) || 0,
+    perUnit,
     entries,
   };
 }

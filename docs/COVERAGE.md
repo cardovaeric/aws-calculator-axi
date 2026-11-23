@@ -41,9 +41,8 @@ Known accuracy gaps even where a service is priceable:
 - **Database Savings Plans / other additional pricing data** attached to a
   `columnFormIPM` (`additionalPricingData`) is not implemented. Reserved
   Instances are implemented; Savings Plans are not.
-- **Direct Connect ports** use a monthly price hidden behind
-  `pricingUnitModel.riPricingTypes.hourly.$overridePriceKeyWith`; this override
-  is not wired up yet.
+- None blocking Direct Connect ports now: the `port:PricePerUnit` override is
+  wired up and matches the calculator (which prices it as an hourly rate).
 - Some services can return `0` for their default configuration because every
   usage input defaults to 0 (for example DocumentDB, Timestream, Keyspaces).
   That matches the calculator, but always check the config summary.
@@ -76,6 +75,7 @@ Validated so far:
 | EC2 | m5.large, RHEL, On-Demand | `$91.25/mo` exact |
 | EC2 | m5.large, EBS 100 GB gp3, detailed monitoring | `$80.18/mo` exact |
 | EC2 | m5.large ×2, Compute Savings 1yr No Upfront | `$103.66/mo` exact |
+| Direct Connect | 1 × 100G Dedicated port at Newark | `$16,425/mo` exact |
 | Lambda/S3/CloudFront/DynamoDB/Fargate/EBS/API Gateway | see README | exact |
 
 ## Remaining roadmap
@@ -98,7 +98,6 @@ Validated so far:
 
 - `columnFormIPM` multi-row support.
 - `additionalPricingData` (Database Savings Plans).
-- Direct Connect `port:PricePerUnit` and monthly port model.
 - WorkSpaces monthly unit shape (Personal / Thin Client / Secure Browser).
 - `input/priceSelector`, `pricingStrategy`, `radioTiles`,
   `conditionalCheckboxes` widgets.

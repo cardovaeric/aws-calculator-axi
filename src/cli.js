@@ -517,6 +517,21 @@ async function columnFormRows(component, definition, template, region, options, 
       id = "pricingModel";
       value = "OnDemand";
       values = valueList(termTypes);
+    } else if (row.selectorId === "port:Connection Type") {
+      id = "portType";
+      value = "-";
+      values = valueList(unique("port:Connection Type"));
+    } else if (row.selectorId === "port:Capacity") {
+      id = "portCapacity";
+      value = "-";
+      values = valueList(unique("port:Capacity"));
+    } else if (row.selectorId === "port:Direct Connect Location") {
+      id = "location";
+      value = "-";
+      values = valueList(unique("port:Direct Connect Location"));
+    } else if (row.exportValueAs === "ports") {
+      id = "ports";
+      value = String(row.defaultValue ?? 1);
     } else {
       continue;
     }

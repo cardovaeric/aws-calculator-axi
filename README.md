@@ -146,7 +146,6 @@ Still missing:
 - **EC2 dedicated/host tenancy, Reserved Instances, Spot, and daily/weekly/monthly spike workloads**
 - **Windows workloads** on EC2 (dedicated host and SQL Server license tables)
 - **WorkSpaces Personal / Thin Client / Secure Browser** monthly pricing shape
-- Direct Connect port monthly price override
 - Multi-row `columnFormIPM` tables and Database Savings Plans
 - `dataTransferV2` matrices (skipped with a warning)
 

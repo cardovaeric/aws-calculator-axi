@@ -92,6 +92,10 @@ const COLUMN_ROW_ALIASES = {
   instanceFamily: "Instance Family",
   databaseEngine: "Database Engine",
   computeFamily: "Compute Family",
+  location: "port:Direct Connect Location",
+  portType: "port:Connection Type",
+  portCapacity: "port:Capacity",
+  workspaces: "Number of WorkSpaces",
 };
 
 function normalizeToken(value) {
@@ -896,7 +900,13 @@ export class Engine {
     const prices = extractPrices(
       data,
       context.display,
-      { termType, term, purchaseOption },
+      {
+        termType,
+        term,
+        purchaseOption,
+        pricingUnitModel: component.pricingUnitModel,
+        calculationId: component.calculationId,
+      },
       rows,
     );
 
@@ -1001,7 +1011,14 @@ export class Engine {
     for (const row of rows) {
       if (!row.selectorId || row.selectorId === "Number of Nodes") continue;
       if (row.selectorId === "Instance Type" && !instanceTable) continue;
-      const value = selected[row.selectorId] ?? pseudo[row.selectorId];
+      let value = selected[row.selectorId] ?? pseudo[row.selectorId];
+      if (
+        (value == null || value === "") &&
+        (row.type === "textInput" || row.type === "numericInput") &&
+        row.exportValueAs
+      ) {
+        value = this.values.get(row.exportValueAs);
+      }
       if (value != null && value !== "") {
         rowState[row.selectorId] = { value: String(value) };
       }
@@ -1042,6 +1059,21 @@ export class Engine {
     if (reserved && leaseRow) summary.push(`${leaseRow.label} (${term})`);
     if (reserved && purchaseRow) {
       summary.push(`${purchaseRow.label} (${purchaseOption})`);
+    }
+    if (!instanceTable) {
+      for (const row of rows) {
+        let value = selected[row.selectorId] ?? pseudo[row.selectorId];
+        if (
+          (value == null || value === "") &&
+          (row.type === "textInput" || row.type === "numericInput") &&
+          row.exportValueAs
+        ) {
+          value = this.values.get(row.exportValueAs);
+        }
+        if (value != null && value !== "") {
+          summary.push(`${row.label} (${value})`);
+        }
+      }
     }
     this.summary.push({
       id: component.id,
