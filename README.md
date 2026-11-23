@@ -128,6 +128,9 @@ Validated by publishing an estimate and comparing the stored total with the calc
 | Fargate | 10 tasks/day, 5 min, 1 vCPU, 2 GB | `$1.35/mo` |
 | API Gateway | 10M REST requests | `$49.60/mo` |
 | EBS | 100 GB gp3 + default snapshots | `$19.49/mo` |
+| EC2 | t4g.nano Linux Compute Savings 3yr | `$1.53/mo` |
+| EC2 | m5.large ×2 Linux On-Demand | `$140.16/mo` |
+| EC2 | m5.large Windows On-Demand | `$137.24/mo` |
 
 ## Coverage
 

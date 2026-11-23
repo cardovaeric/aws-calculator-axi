@@ -548,6 +548,16 @@ export class Engine {
     }
 
     const tenancyValue = this.values.get("tenancy") ?? "shared";
+    if (tenancyValue !== "shared") {
+      throw new AxiError(
+        `EC2 ${tenancyValue} tenancy is not supported yet`,
+        "UNSUPPORTED_SERVICE",
+        [
+          "Only shared tenancy is implemented",
+          "Dedicated instances and Dedicated Hosts require separate pricing tables",
+        ],
+      );
+    }
     const osValue = this.values.get("selectedOS") ?? "linux";
     const tenancyLabel =
       EC2_TENANCY_LABELS[tenancyValue] ??
@@ -591,6 +601,19 @@ export class Engine {
     seenOverrides.add("upfront");
 
     const strategy = normalizeEc2Strategy(strategyText);
+    if (
+      !/on-?demand|compute|instance|spot|standard|convertible/i.test(
+        String(strategyText),
+      )
+    ) {
+      throw new AxiError(
+        `Unknown EC2 pricing strategy "${strategyText}"`,
+        "VALIDATION_ERROR",
+        [
+          "Use on-demand, compute-savings, instance-savings (standard/convertible/spot are not supported yet)",
+        ],
+      );
+    }
     if (strategy === "standard" || strategy === "convertible" || strategy === "spot") {
       throw new AxiError(
         `EC2 pricing strategy "${strategyText}" is not supported yet`,
