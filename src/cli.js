@@ -1038,20 +1038,28 @@ async function getCommand(args) {
       createdOn: estimate.createdOn,
     },
   };
+  let truncated = false;
   if (estimate.services.length === 0) {
     output.services = "estimate contains no services";
   } else {
-    output.services = estimate.services.map((service) => ({
-      name: service.name,
-      region: service.region,
-      monthly: service.monthly,
-      upfront: service.upfront,
-      config: flags.full
-        ? service.config
-        : truncate(service.config, 110),
-    }));
+    output.services = estimate.services.map((service) => {
+      if (!flags.full && String(service.config).length > 110) truncated = true;
+      return {
+        name: service.name,
+        region: service.region,
+        monthly: service.monthly,
+        upfront: service.upfront,
+        config: flags.full ? service.config : truncate(service.config, 110),
+      };
+    });
   }
-  if (flags.full) output.raw = estimate.raw;
+  if (flags.full) {
+    output.raw = estimate.raw;
+  } else if (truncated) {
+    output.help = [
+      `Run \`awscalc get ${key} --full\` for full config summaries and stored JSON`,
+    ];
+  }
   return output;
 }
 
