@@ -222,6 +222,27 @@ export async function loadEc2SavingsIndex(
   }
 }
 
+const SPOT_ADVISOR_URL =
+  "https://spot-bid-advisor.s3.amazonaws.com/spot-advisor-data.json";
+
+export async function loadSpotAdvisor(fetchOptions = {}) {
+  return fetchJson(SPOT_ADVISOR_URL, {
+    ttlMs: 6 * 60 * 60 * 1000,
+    ...fetchOptions,
+  });
+}
+
+export function spotDiscountFor(advisor, { region, os, instanceType }) {
+  const osKey = os;
+  const value =
+    advisor?.spot_advisor?.[region]?.[osKey]?.[instanceType]?.s ??
+    advisor?.spot_advisor?.[region]?.[String(os).toLowerCase()]?.[instanceType]
+      ?.s ??
+    0;
+  const discount = Number(value);
+  return Number.isFinite(discount) ? discount : 0;
+}
+
 export function extractEc2SavingsRate(
   index,
   display,

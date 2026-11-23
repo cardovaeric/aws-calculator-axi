@@ -28,7 +28,9 @@ import {
   loadEc2Context,
   loadEc2Index,
   loadEc2SavingsIndex,
+  loadSpotAdvisor,
   selectEc2Aggregation,
+  spotDiscountFor,
 } from "./ec2.js";
 
 const SUPPORTED_MATH = new Set([
@@ -618,13 +620,13 @@ export class Engine {
         ],
       );
     }
-    if (strategy === "standard" || strategy === "convertible" || strategy === "spot") {
+    if (strategy === "standard" || strategy === "convertible") {
       throw new AxiError(
         `EC2 pricing strategy "${strategyText}" is not supported yet`,
         "UNSUPPORTED_SERVICE",
         [
-          "Use `--set pricingStrategy=on-demand`, `compute-savings`, or `instance-savings`",
-          "Reserved Instances and Spot pricing are not implemented",
+          "Reserved Instances are not implemented",
+          "Use on-demand, compute-savings, instance-savings, or spot",
         ],
       );
     }
@@ -656,6 +658,15 @@ export class Engine {
     const totalHours = instances * 730;
 
     let savingsRate = null;
+    let spotDiscount = 0;
+    if (strategy === "spot") {
+      const advisor = await loadSpotAdvisor(this.fetchOptions);
+      spotDiscount = spotDiscountFor(advisor, {
+        region: this.region,
+        os: osSelection.os,
+        instanceType,
+      });
+    }
     if (strategy === "compute-savings" || strategy === "instance-savings") {
       if (purchaseOption !== "No Upfront") {
         throw new AxiError(
@@ -691,11 +702,18 @@ export class Engine {
       }
     }
 
+    const spotCost =
+      strategy === "spot"
+        ? roundHalfUp(
+            onDemandRate * totalHours * (1 - spotDiscount / 100),
+            2,
+          )
+        : 0;
     const costs = {
       onDemandCost:
         strategy === "on-demand"
           ? roundHalfUp(onDemandRate * totalHours, 2)
-          : 0,
+          : spotCost,
       upfrontCost: 0,
       monthlyCost: 0,
       instanceSavingsCost:
@@ -722,17 +740,24 @@ export class Engine {
       this.values.set(fetcher.id, onDemandRate);
     }
 
-    const strategyState = {
-      selectedOption: strategy,
-      term: `${term} Year`,
-      upfrontPayment: purchaseOption === "No Upfront" ? "None" : purchaseOption,
-      model:
-        strategy === "on-demand"
-          ? "onDemand"
-          : strategy === "instance-savings"
-            ? "instanceSavings"
-            : "computeSavings",
-    };
+    const strategyState =
+      strategy === "spot"
+        ? {
+            selectedOption: "spot",
+            spotDiscountPercentage: String(spotDiscount),
+          }
+        : {
+            selectedOption: strategy,
+            term: `${term} Year`,
+            upfrontPayment:
+              purchaseOption === "No Upfront" ? "None" : purchaseOption,
+            model:
+              strategy === "on-demand"
+                ? "onDemand"
+                : strategy === "instance-savings"
+                  ? "instanceSavings"
+                  : "computeSavings",
+          };
     if (workloadComponent) {
       this.rawInputs.set(workloadComponent.id, {
         value: { workloadType, data: String(instances) },
@@ -760,9 +785,11 @@ export class Engine {
     const strategyLabel =
       strategy === "on-demand"
         ? "On-Demand"
-        : strategy === "instance-savings"
-          ? `EC2 Instance Savings Plans ${term}yr ${purchaseOption}`
-          : `Compute Savings Plans ${term}yr ${purchaseOption}`;
+        : strategy === "spot"
+          ? `Spot Discount: ${spotDiscount}`
+          : strategy === "instance-savings"
+            ? `EC2 Instance Savings Plans ${term}yr ${purchaseOption}`
+            : `Compute Savings Plans ${term}yr ${purchaseOption}`;
     this.summary.push({
       id: "workload",
       label: "Workload",
@@ -787,7 +814,14 @@ export class Engine {
       rows.find((row) => row.selectorId === selector);
     const byExport = (name) =>
       rows.find((row) => row.exportValueAs === name);
-    const nodeRow = byExport("count") ?? bySelector("Number of Nodes");
+    const nodeRow =
+      byExport("count") ??
+      bySelector("Number of Nodes") ??
+      rows.find(
+        (row) =>
+          (row.type === "textInput" || row.type === "numericInput") &&
+          /\bnodes?\b/i.test(String(row.label ?? "")),
+      );
     const instanceRow =
       bySelector("Instance Type") ?? bySelector("Compute Family");
     const utilizationRow = rows.find((row) => row.type === "utilization");
@@ -911,26 +945,39 @@ export class Engine {
     );
 
     const nodes = asNumber(
-      pseudo["Number of Nodes"] ?? nodeRow?.defaultValue ?? 1,
+      pseudo["Number of Nodes"] ??
+        (nodeRow?.selectorId ? pseudo[nodeRow.selectorId] : undefined) ??
+        nodeRow?.defaultValue ??
+        1,
     );
-    const utilization = Math.min(
-      100,
-      Math.max(
-        0,
-        asNumber(
-          pseudo.utilization ??
-            utilizationRow?.defaultValue ??
-            100,
-        ),
-      ),
-    );
+    let utilizationHours = 730;
+    let utilizationValue = "100";
+    let utilizationUnit = "%Utilized/Month";
+    if (pseudo.utilization != null) {
+      const pct = Math.min(100, Math.max(0, asNumber(pseudo.utilization)));
+      utilizationHours = (730 * pct) / 100;
+      utilizationValue = String(pct);
+    } else if (
+      utilizationRow?.defaultValue &&
+      typeof utilizationRow.defaultValue === "object"
+    ) {
+      const raw = utilizationRow.defaultValue;
+      const unit = Number(raw.unit);
+      const selectedId = String(raw.selectedId ?? "%Utilized/Month");
+      utilizationValue = String(Number.isFinite(unit) ? unit : 730);
+      utilizationUnit = selectedId;
+      if (/Hours\/Day/i.test(selectedId)) {
+        utilizationHours =
+          (Number.isFinite(unit) ? unit : 1) * (365 / 12);
+      } else {
+        utilizationHours = Number.isFinite(unit) ? unit : 730;
+      }
+    }
+    const utilization = (utilizationHours / 730) * 100;
     const monthly =
       instanceTable && component.calculationId?.monthly
         ? roundHalfUp(
-            nodes *
-              prices.hourly *
-              730 *
-              (reserved ? 1 : utilization / 100),
+            nodes * prices.hourly * (reserved ? 730 : utilizationHours),
             2,
           )
         : null;
@@ -998,8 +1045,8 @@ export class Engine {
     if (utilizationRow) {
       rowState.undefined = {
         value: {
-          unit: String(utilization),
-          selectedId: "%Utilized/Month",
+          unit: utilizationValue,
+          selectedId: utilizationUnit,
         },
       };
     }
@@ -1042,7 +1089,7 @@ export class Engine {
     }
     if (instanceTable && utilizationRow) {
       summary.push(
-        `${utilizationRow.label} (${formatNumber(utilization)} %Utilized/Month)`,
+        `${utilizationRow.label} (${utilizationValue} ${utilizationUnit})`,
       );
     }
     if (instanceTable && deploymentRow) {

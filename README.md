@@ -139,11 +139,11 @@ The calculator publishes 441 service definitions. `awscalc` can price:
 - **162 of 163 top-level single services**
 - **33 of 33 grouped services**, with **205 of 208 sub-services**
 - PLC 2.0 instance tables (RDS family, Aurora, ElastiCache, OpenSearch, MSK, Neptune, DocumentDB, Redshift, Keyspaces, MemoryDB, …) including **Reserved Instances** (No/Partial/All Upfront)
-- **EC2 shared tenancy** with On-Demand, Compute Savings Plans, and Instance Savings Plans, plus EBS and detailed monitoring
+- **EC2 shared tenancy** with On-Demand, Compute Savings Plans, Instance Savings Plans, and Spot, plus EBS and detailed monitoring
 
 Still missing:
 
-- **EC2 dedicated/host tenancy, Reserved Instances, Spot, and daily/weekly/monthly spike workloads**
+- **EC2 dedicated/host tenancy, Reserved Instances, and daily/weekly/monthly spike workloads**
 - **Windows workloads** on EC2 (dedicated host and SQL Server license tables)
 - **WorkSpaces Personal / Thin Client / Secure Browser** monthly pricing shape
 - Multi-row `columnFormIPM` tables and Database Savings Plans

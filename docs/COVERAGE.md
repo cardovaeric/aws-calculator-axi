@@ -13,7 +13,7 @@ what is still missing, and how each piece is validated.
 | Standard AWS regions + Local/Wavelength zones | **116 codes** |
 | Per-service region availability | Checked from `regionList/publish.json` |
 | PLC 2.0 pricing (instance tables) | On-demand + Reserved (No/Partial/All Upfront) |
-| EC2 shared tenancy | On-Demand + Compute/Instance Savings Plans, EBS, monitoring |
+| EC2 shared tenancy | On-Demand + Compute/Instance Savings Plans + Spot, EBS, monitoring |
 | `columnFormIPM` rows | Single row per table, indexed for multi-table services |
 
 Remaining top-level service that cannot be priced yet:
@@ -76,6 +76,9 @@ Validated so far:
 | EC2 | m5.large, EBS 100 GB gp3, detailed monitoring | `$80.18/mo` exact |
 | EC2 | m5.large ×2, Compute Savings 1yr No Upfront | `$103.66/mo` exact |
 | Direct Connect | 1 × 100G Dedicated port at Newark | `$16,425/mo` exact |
+| EC2 | t4g.nano Spot (54% discount) | `$1.41/mo` exact |
+| OpenSearch | defaults with 3 dedicated masters | `$621.96/mo` exact |
+| DocumentDB | 1 × db.r5.large, 730 hours | `$202.21/mo` exact |
 | Lambda/S3/CloudFront/DynamoDB/Fargate/EBS/API Gateway | see README | exact |
 
 ## Remaining roadmap
@@ -86,7 +89,8 @@ Validated so far:
 - [x] `ec2PriceFetcher`: on-demand + Compute/Instance Savings Plans.
 - [x] Constant workload hours and EBS/monitoring cards.
 - [ ] Daily/weekly/monthly spike workload math.
-- [ ] EC2 Reserved Instances (standard/convertible) and Spot.
+- [ ] EC2 Reserved Instances (standard/convertible).
+- [x] EC2 Spot (spot advisor discount).
 - [ ] Dedicated/host tenancy and `dedicatedHostsMath`.
 
 ### Phase 3 — Windows workloads
