@@ -43,10 +43,10 @@ export async function loadPricingMaps(
   await Promise.all(
     mappingDefinitions.map(async (mapping) => {
       if (mapping.mappingDefinitionVersion === "PLC_2.0") {
+        // PLC mappings are queried by the columnFormIPM/PLC engine instead of
+        // being merged into a metered-unit map. Track them so components that
+        // reference one directly fail loudly.
         unsupportedMappings.add(mapping.mappingDefinitionName);
-        warnings.push(
-          `${mapping.mappingDefinitionName}: advanced (PLC 2.0) pricing data is not supported yet`,
-        );
         return;
       }
       const url = resolveUrl(mapping.mappingDefinitionURL, currency);

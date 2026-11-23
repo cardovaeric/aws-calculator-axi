@@ -26,6 +26,7 @@ import {
   loadPricingMaps,
   mappingDefinitionsFor,
 } from "./pricing.js";
+import { loadPlcContext } from "./plc.js";
 import { DEFAULT_REGION, REGION_NAMES, resolveRegion } from "./regions.js";
 import { recentForCwd, recordEstimate, readHistory } from "./store.js";
 import { VERSION } from "./version.js";
@@ -438,6 +439,91 @@ function inputDefaultText(component) {
   }
 }
 
+async function columnFormRows(component, definition, template, region, options, index = 1) {
+  const rows = component.row ?? [];
+  const mapping = [
+    ...(definition.mappingDefinitions ?? []),
+    ...(template.mappingDefinitions ?? []),
+  ].find((item) => item.mappingDefinitionName === component.mappingDefinitionName);
+  let aggregations = [];
+  if (mapping) {
+    try {
+      const context = await loadPlcContext(mapping, { region, ...options });
+      aggregations = context.aggregation?.aggregations ?? [];
+    } catch {
+      aggregations = [];
+    }
+  }
+  const unique = (key) => [
+    ...new Set(
+      aggregations
+        .map((entry) => entry.selectors?.[key])
+        .filter((value) => value != null && value !== ""),
+    ),
+  ];
+  const instanceTypes = unique("Instance Type").sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true }),
+  );
+  const smallest = aggregations
+    .filter(
+      (entry) =>
+        (entry.selectors?.TermType ?? "OnDemand") === "OnDemand",
+    )
+    .sort((a, b) => {
+      const vcpu =
+        Number(a.selectors?.vCPU ?? 0) - Number(b.selectors?.vCPU ?? 0);
+      if (vcpu !== 0) return vcpu;
+      return String(a.selectors?.["Instance Type"]).localeCompare(
+        String(b.selectors?.["Instance Type"]),
+      );
+    })[0]?.selectors?.["Instance Type"];
+  const deploymentOptions = unique("Deployment Option");
+  const termTypes = unique("TermType");
+  const out = [];
+  const valueList = (items, limit = 8) =>
+    items.length === 0
+      ? "-"
+      : `${items.slice(0, limit).join("|")}${
+          items.length > limit ? `|...(+${items.length - limit})` : ""
+        }`;
+
+  for (const row of rows) {
+    let id;
+    let value = "-";
+    let values = "-";
+    if (row.type === "autoSuggest" && row.selectorId === "Instance Type") {
+      id = "instanceType";
+      value = smallest ?? "-";
+      values = valueList(instanceTypes);
+    } else if (row.exportValueAs === "count") {
+      id = "nodes";
+      value = String(row.defaultValue ?? 1);
+    } else if (row.type === "utilization") {
+      id = "utilization";
+      value = "100";
+    } else if (row.selectorId === "Deployment Option") {
+      id = "deployment";
+      value = deploymentOptions.includes("Single-AZ")
+        ? "Single-AZ"
+        : deploymentOptions[0] ?? "-";
+      values = valueList(deploymentOptions);
+    } else if (row.selectorId === "TermType") {
+      id = "pricingModel";
+      value = "OnDemand";
+      values = valueList(termTypes);
+    } else {
+      continue;
+    }
+    out.push({
+      id: `${id}${index === 1 ? "" : index}`,
+      type: "plcSelector",
+      default: value,
+      values,
+    });
+  }
+  return out;
+}
+
 async function serviceCommand(args) {
   const { flags, positionals } = parseFlags("service", args);
   if (positionals.length === 0) {
@@ -549,6 +635,24 @@ async function serviceCommand(args) {
       inputs.push(row);
     }
   }
+  let columnFormCount = 0;
+  for (const card of template.cards ?? []) {
+    for (const component of card.inputSection?.components ?? []) {
+      if (component.type === "input" && component.subType === "columnFormIPM") {
+        columnFormCount += 1;
+        inputs.push(
+          ...(await columnFormRows(
+            component,
+            definition,
+            template,
+            region,
+            options,
+            columnFormCount,
+          )),
+        );
+      }
+    }
+  }
   const limit = flags.limit ? Number(flags.limit) : 120;
   const rows = inputs.slice(0, limit);
   const output = {
@@ -578,6 +682,11 @@ async function serviceCommand(args) {
         .filter((item) => item?.id)
         .map((item) => item.id)
         .join(", ")} — select with --template`,
+    );
+  }
+  if (columnFormCount > 1) {
+    help.push(
+      `This service has ${columnFormCount} instance tables: use instanceType2, deployment2, … for the second and later tables`,
     );
   }
   if (inputs.length > rows.length) {
@@ -709,15 +818,20 @@ async function priceSingle({
 }) {
   await assertRegionAvailable(service, definition, region, options);
   const template = selectTemplate(definition, flags.template);
+  const mappingDefinitions = mappingDefinitionsFor(definition, template);
+  const hasPlc = mappingDefinitions.some(
+    (mapping) => mapping.mappingDefinitionVersion === "PLC_2.0",
+  );
   const {
     maps,
     warnings: mapWarnings,
     unsupportedMappings,
-  } = await loadPricingMaps(
-    mappingDefinitionsFor(definition, template),
-    { region, currency, ...options },
-  );
-  assertSupportedMappings(maps, mapWarnings);
+  } = await loadPricingMaps(mappingDefinitions, {
+    region,
+    currency,
+    ...options,
+  });
+  if (!hasPlc) assertSupportedMappings(maps, mapWarnings);
 
   const engine = new Engine({
     definition,
@@ -727,8 +841,9 @@ async function priceSingle({
     maps,
     currency,
     unsupportedMappings,
+    fetchOptions: options,
   });
-  const { unknown } = engine.resolveInputs(overrides);
+  const { unknown } = await engine.resolveInputs(overrides);
   if (unknown.length > 0) {
     const known = validInputIds(engine);
     throw new AxiError(
@@ -916,10 +1031,11 @@ async function priceGroup({
       maps,
       currency,
       unsupportedMappings,
+      fetchOptions: options,
     });
     let result;
     try {
-      engine.resolveInputs(scoped);
+      await engine.resolveInputs(scoped);
       result = engine.evaluate();
     } catch (error) {
       if (flags.subservice?.length > 0) throw error;

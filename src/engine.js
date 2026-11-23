@@ -12,6 +12,12 @@ import {
   roundHalfUp,
   roundUpTo,
 } from "./units.js";
+import {
+  extractPrices,
+  loadPlcContext,
+  loadPlcIndex,
+  selectAggregation,
+} from "./plc.js";
 
 const SUPPORTED_MATH = new Set([
   "basicMaths",
@@ -44,6 +50,7 @@ const SUPPORTED_INPUT = new Set([
   "bodyText",
   "headerText",
   "condition",
+  "columnFormIPM",
 ]);
 
 const NON_VALUE_INPUT = new Set([
@@ -52,6 +59,21 @@ const NON_VALUE_INPUT = new Set([
   "headerText",
   "condition",
 ]);
+
+// CLI aliases for the single row of a columnFormIPM instance table.
+const COLUMN_ROW_ALIASES = {
+  instanceType: "Instance Type",
+  nodes: "Number of Nodes",
+  deployment: "Deployment Option",
+  pricingModel: "TermType",
+  term: "LeaseContractLength",
+  purchaseOption: "PurchaseOption",
+  utilization: "utilization",
+  engine: "Cache Engine",
+  instanceFamily: "Instance Family",
+  databaseEngine: "Database Engine",
+  computeFamily: "Compute Family",
+};
 
 function normalizeToken(value) {
   return String(value ?? "")
@@ -65,6 +87,21 @@ function asNumber(value) {
   if (value == null || value === "") return 0;
   const n = Number(String(value).replace(/,/g, ""));
   return Number.isFinite(n) ? n : 0;
+}
+
+function normalizeTerm(term) {
+  const text = String(term ?? "").toLowerCase();
+  if (/^1|\b1\s*(?:yr|year)/.test(text)) return "1yr";
+  if (/^3|\b3\s*(?:yr|year)/.test(text)) return "3yr";
+  return String(term ?? "");
+}
+
+function normalizePurchaseOption(option) {
+  const text = String(option ?? "").toLowerCase();
+  if (text.includes("all")) return "All Upfront";
+  if (text.includes("partial")) return "Partial Upfront";
+  if (text.includes("no")) return "No Upfront";
+  return String(option ?? "");
 }
 
 function maybeNumber(value) {
@@ -177,6 +214,7 @@ export class Engine {
     maps,
     currency,
     unsupportedMappings = new Set(),
+    fetchOptions = {},
   }) {
     this.definition = definition;
     this.template = template;
@@ -184,6 +222,7 @@ export class Engine {
     this.displayRegion = displayRegion;
     this.maps = maps;
     this.unsupportedMappings = unsupportedMappings;
+    this.fetchOptions = fetchOptions;
     this.currency = currency ?? "USD";
     this.values = new Map();
     this.rawInputs = new Map();
@@ -350,8 +389,14 @@ export class Engine {
   }
 
   /** Resolve all inputs (with user overrides) and pricing lookups. */
-  resolveInputs(overrides = {}) {
+  async resolveInputs(overrides = {}) {
     const seenOverrides = new Set();
+    let columnIndex = 0;
+    const hasColumnForm = this.cards().some((card) =>
+      (card.inputSection?.components ?? []).some(
+        (component) => component.subType === "columnFormIPM",
+      ),
+    );
     for (const card of this.cards()) {
       if (!this.cardIsVisible(card)) continue;
       const components = card.inputSection?.components ?? [];
@@ -362,6 +407,20 @@ export class Engine {
           continue;
         }
         if (component.type !== "input") continue;
+        if (component.subType === "columnFormIPM") {
+          columnIndex += 1;
+          const suffix = columnIndex === 1 ? "" : String(columnIndex);
+          const pseudo = {};
+          for (const [alias, selector] of Object.entries(COLUMN_ROW_ALIASES)) {
+            const key = `${alias}${suffix}`;
+            if (overrides[key] !== undefined) {
+              pseudo[selector] = overrides[key].text;
+              seenOverrides.add(key);
+            }
+          }
+          await this.resolveColumnFormIPM(component, pseudo, columnIndex);
+          continue;
+        }
         const provided =
           overrides[component.id] ?? this.suppliedByLabel(component, overrides);
         if (provided !== undefined && provided !== null) {
@@ -371,9 +430,299 @@ export class Engine {
       }
     }
     const unknown = Object.keys(overrides).filter(
-      (id) => !seenOverrides.has(id) && !this.findComponent(id),
+      (id) =>
+        !seenOverrides.has(id) &&
+        !this.findComponent(id) &&
+        !(
+          hasColumnForm &&
+          /^(?:instanceType|nodes|deployment|pricingModel|term|purchaseOption|utilization)\d*$/.test(
+            id,
+          )
+        ),
     );
     return { unknown };
+  }
+
+  findMapping(name) {
+    const mappings = [
+      ...(this.definition.mappingDefinitions ?? []),
+      ...(this.template.mappingDefinitions ?? []),
+    ];
+    return mappings.find((mapping) => mapping.mappingDefinitionName === name);
+  }
+
+  /** Resolve a columnFormIPM instance table row via the PLC 2.0 price index. */
+  async resolveColumnFormIPM(component, pseudo = {}, index = 1) {
+    const rows = component.row ?? [];
+    const bySelector = (selector) =>
+      rows.find((row) => row.selectorId === selector);
+    const byExport = (name) =>
+      rows.find((row) => row.exportValueAs === name);
+    const nodeRow = byExport("count") ?? bySelector("Number of Nodes");
+    const instanceRow =
+      bySelector("Instance Type") ?? bySelector("Compute Family");
+    const utilizationRow = rows.find((row) => row.type === "utilization");
+    const deploymentRow = bySelector("Deployment Option");
+    const termTypeRow = bySelector("TermType");
+    const leaseRow = bySelector("LeaseContractLength");
+    const purchaseRow = bySelector("PurchaseOption");
+
+    const mapping = this.findMapping(component.mappingDefinitionName);
+    if (!mapping) {
+      throw new AxiError(
+        `Missing PLC metadata for ${component.id}`,
+        "UNSUPPORTED_SERVICE",
+      );
+    }
+    const context = await loadPlcContext(mapping, {
+      region: this.region,
+      currency: this.currency,
+      ...this.fetchOptions,
+    });
+
+    const aggregations = context.aggregation?.aggregations ?? [];
+    const deployment =
+      pseudo["Deployment Option"] ??
+      (aggregations.some(
+        (entry) => entry.selectors?.["Deployment Option"] === "Single-AZ",
+      )
+        ? "Single-AZ"
+        : aggregations[0]?.selectors?.["Deployment Option"]);
+    const hasTermSelector = (context.meta.primarySelectors ?? [])
+      .concat(context.meta.secondarySelectors ?? [])
+      .includes("TermType");
+    const termType =
+      pseudo["TermType"] ??
+      termTypeRow?.defaultValue ??
+      "OnDemand";
+    const reserved = /reserved/i.test(String(termType));
+    if (
+      hasTermSelector &&
+      !reserved &&
+      termType !== "OnDemand" &&
+      termType !== "Hourly"
+    ) {
+      throw new AxiError(
+        `Pricing model "${termType}" is not supported yet for this service`,
+        "UNSUPPORTED_SERVICE",
+        [
+          "Use `--set pricingModel=OnDemand` or `pricingModel=Reserved`",
+          "Database Savings Plans / other commitment models are not implemented",
+        ],
+      );
+    }
+    const term = reserved
+      ? normalizeTerm(
+          pseudo["LeaseContractLength"] ?? leaseRow?.defaultValue ?? "1yr",
+        )
+      : "";
+    const purchaseOption = reserved
+      ? normalizePurchaseOption(
+          pseudo["PurchaseOption"] ?? purchaseRow?.defaultValue ?? "No Upfront",
+        )
+      : "";
+
+    const instanceTable = Boolean(instanceRow) && Boolean(component.calculationId?.monthly);
+    const instanceSelector = instanceRow?.selectorId;
+    let instanceType =
+      instanceSelector ? pseudo[instanceSelector] : undefined;
+    if (instanceTable && !instanceType) {
+      const candidates = aggregations
+        .filter(
+          (entry) =>
+            (!deployment ||
+              entry.selectors?.["Deployment Option"] === deployment) &&
+            (entry.selectors?.TermType ?? "OnDemand") === termType,
+        )
+        .sort((a, b) => {
+          const vcpu = Number(a.selectors?.vCPU ?? 0) - Number(b.selectors?.vCPU ?? 0);
+          if (vcpu !== 0) return vcpu;
+          return String(a.selectors?.["Instance Type"]).localeCompare(
+            String(b.selectors?.["Instance Type"]),
+          );
+        });
+      instanceType = candidates[0]?.selectors?.[instanceSelector];
+    }
+
+    const desired = {
+      [instanceSelector]: instanceType,
+      "Deployment Option": deployment,
+      TermType: termType,
+      "Cache Engine": pseudo["Cache Engine"],
+      "Instance Family": pseudo["Instance Family"],
+      "Database Engine": pseudo["Database Engine"],
+      LeaseContractLength: term || undefined,
+      PurchaseOption: purchaseOption || undefined,
+    };
+    const selectorKeys = new Set([
+      ...(context.meta.primarySelectors ?? []),
+      ...(context.meta.secondarySelectors ?? []),
+    ]);
+    for (const key of Object.keys(desired)) {
+      if (!selectorKeys.has(key)) delete desired[key];
+    }
+    const aggregation = selectAggregation(context, desired);
+    const selected = aggregation.selectors ?? {};
+    const { data } = await loadPlcIndex(
+      context,
+      selected,
+      this.fetchOptions,
+    );
+    const prices = extractPrices(
+      data,
+      context.display,
+      { termType, term, purchaseOption },
+      rows,
+    );
+
+    const nodes = asNumber(
+      pseudo["Number of Nodes"] ?? nodeRow?.defaultValue ?? 1,
+    );
+    const utilization = Math.min(
+      100,
+      Math.max(
+        0,
+        asNumber(
+          pseudo.utilization ??
+            utilizationRow?.defaultValue ??
+            100,
+        ),
+      ),
+    );
+    const monthly =
+      instanceTable && component.calculationId?.monthly
+        ? roundHalfUp(
+            nodes *
+              prices.hourly *
+              730 *
+              (reserved ? 1 : utilization / 100),
+            2,
+          )
+        : null;
+    const upfront = roundHalfUp(
+      (instanceTable ? nodes : 1) * prices.upfront,
+      2,
+    );
+
+    if (monthly != null) {
+      this.values.set(component.calculationId.monthly, monthly);
+    }
+    if (component.calculationId?.upfront) {
+      this.values.set(component.calculationId.upfront, upfront);
+    }
+    if (!instanceTable && component.calculationId?.hourly) {
+      this.values.set(component.calculationId.hourly, prices.hourly);
+    }
+    if (component.calculationId?.countly) {
+      this.values.set(component.calculationId.countly, prices.perUnit);
+    }
+    for (const row of rows) {
+      if (row.type !== "textInput" && row.type !== "numericInput") continue;
+      if (!row.exportValueAs) continue;
+      const value = asNumber(
+        pseudo[row.selectorId] ?? row.defaultValue ?? 0,
+      );
+      this.values.set(row.exportValueAs, value);
+    }
+
+    const exported = {
+      count: nodes,
+      deploymentStrategy: selected["Deployment Option"] ?? deployment,
+      pricingModel: selected.TermType ?? termType,
+      term: selected.LeaseContractLength ?? "",
+      purchaseOption: selected.PurchaseOption ?? "",
+      utilizationOut: utilization,
+    };
+    for (const row of rows) {
+      if (row.exportValueAs && exported[row.exportValueAs] !== undefined) {
+        this.values.set(row.exportValueAs, exported[row.exportValueAs]);
+      }
+      for (const tag of Object.values(row.exportTagsAsValue ?? {})) {
+        const value = selected[tag.id];
+        if (value != null) {
+          this.values.set(tag.id, asNumber(value.replace(/[^\d.]/g, "")));
+        }
+      }
+    }
+    if (selected.vCPU != null) this.values.set("vCPU", asNumber(selected.vCPU));
+    if (selected.Memory != null) {
+      this.values.set("Memory", asNumber(String(selected.Memory).replace(/[^\d.]/g, "")));
+    }
+
+    const rowState = {};
+    if (instanceTable && nodeRow) {
+      rowState[nodeRow.selectorId ?? nodeRow.label ?? "Nodes"] = {
+        value: String(nodes),
+      };
+    }
+    if (instanceRow) {
+      rowState[instanceRow.selectorId ?? "Instance Type"] = {
+        value: String(instanceType),
+      };
+    }
+    if (utilizationRow) {
+      rowState.undefined = {
+        value: {
+          unit: String(utilization),
+          selectedId: "%Utilized/Month",
+        },
+      };
+    }
+    if (deploymentRow) {
+      rowState[deploymentRow.selectorId ?? "Deployment Option"] = {
+        value: String(selected["Deployment Option"] ?? deployment),
+      };
+    }
+    for (const row of rows) {
+      if (!row.selectorId || row.selectorId === "Number of Nodes") continue;
+      if (row.selectorId === "Instance Type" && !instanceTable) continue;
+      const value = selected[row.selectorId] ?? pseudo[row.selectorId];
+      if (value != null && value !== "") {
+        rowState[row.selectorId] = { value: String(value) };
+      }
+    }
+    if (reserved && leaseRow) {
+      rowState[leaseRow.selectorId ?? "LeaseContractLength"] = {
+        value: term,
+      };
+    }
+    if (reserved && purchaseRow) {
+      rowState[purchaseRow.selectorId ?? "PurchaseOption"] = {
+        value: purchaseOption,
+      };
+    }
+    this.rawInputs.set(component.id, { value: [rowState] });
+
+    const summary = [];
+    if (instanceTable && nodeRow) summary.push(`${nodeRow.label} (${nodes})`);
+    if (instanceTable && instanceRow) {
+      summary.push(`${instanceRow.label} (${instanceType})`);
+    }
+    if (instanceTable && utilizationRow) {
+      summary.push(
+        `${utilizationRow.label} (${formatNumber(utilization)} %Utilized/Month)`,
+      );
+    }
+    if (instanceTable && deploymentRow) {
+      summary.push(
+        `${deploymentRow.label} (${selected["Deployment Option"] ?? deployment})`,
+      );
+    }
+    if (termTypeRow) {
+      const label = termTypeRow.mappingValue
+        ? termTypeRow.mappingValue[selected.TermType] ?? selected.TermType
+        : selected.TermType ?? termType;
+      summary.push(`${termTypeRow.label} (${label})`);
+    }
+    if (reserved && leaseRow) summary.push(`${leaseRow.label} (${term})`);
+    if (reserved && purchaseRow) {
+      summary.push(`${purchaseRow.label} (${purchaseOption})`);
+    }
+    this.summary.push({
+      id: component.id,
+      label: component.label,
+      text: summary.join(", "),
+    });
   }
 
   suppliedByLabel(component, overrides) {
@@ -1124,6 +1473,14 @@ export class Engine {
     return units[this.displayRegion] ?? units.allRegions;
   }
 
+  operandMissing(operand) {
+    if (!operand?.variableId) return false;
+    return (
+      !this.values.has(operand.variableId) &&
+      !this.pricingValues.has(operand.variableId)
+    );
+  }
+
   operandValue(operand) {
     if (operand == null) return 0;
     if ("constant" in operand) return asNumber(operand.constant);
@@ -1153,10 +1510,15 @@ export class Engine {
       const target = component.refer ?? component.operands?.[0]?.variableId;
       result = target ? asNumber(this.values.get(target)) : 0;
     } else if (component.subType === "basicMaths") {
+      const missingRequired = (component.operands ?? []).some(
+        (operand) => operand.required && this.operandMissing(operand),
+      );
       const operands = (component.operands ?? []).map((operand) =>
         this.operandValue(operand),
       );
-      switch (component.operation) {
+      if (missingRequired) {
+        result = 0;
+      } else switch (component.operation) {
         case "multiplication":
           result = operands.reduce((acc, value) => acc * value, 1);
           break;
@@ -1186,23 +1548,35 @@ export class Engine {
         result = component.minValue;
       }
     } else if (component.subType === "maxMin") {
-      const operands = (component.operands ?? []).map((operand) =>
-        this.operandValue(operand),
-      );
-      result =
-        component.operation === "Minimum"
-          ? Math.min(...operands)
-          : Math.max(...operands);
+      if (
+        (component.operands ?? []).some(
+          (operand) => operand.required && this.operandMissing(operand),
+        )
+      ) {
+        result = 0;
+      } else {
+        const operands = (component.operands ?? []).map((operand) =>
+          this.operandValue(operand),
+        );
+        result =
+          component.operation === "Minimum"
+            ? Math.min(...operands)
+            : Math.max(...operands);
+      }
     } else if (component.subType === "rounding") {
-      const value = this.operandValue(component.operands?.[0]);
+      const operand = component.operands?.[0];
+      const value = this.operandValue(operand);
       const factor = asNumber(component.factor ?? 1) || 1;
       const method = component.method ?? "roundUp";
-      if (method === "roundUp") result = roundUpTo(value, factor);
+      if (operand?.required && this.operandMissing(operand)) result = 0;
+      else if (method === "roundUp") result = roundUpTo(value, factor);
       else if (method === "roundDown") result = roundDownTo(value, factor);
       else if (method === "round") result = roundHalfUp(value / factor) * factor;
       else result = value;
     } else if (component.subType === "tieredPricingMath") {
-      const amount = this.operandValue({ variableId: component.inputRefer });
+      const amount = this.operandMissing({ variableId: component.inputRefer })
+        ? 0
+        : this.operandValue({ variableId: component.inputRefer });
       const pricing = this.pricingValues.get(component.tieredPricingRefer);
       result = this.tieredCost(amount, pricing);
     } else if (component.subType === "snapShotMaths") {

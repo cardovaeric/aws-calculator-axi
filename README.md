@@ -133,17 +133,59 @@ Validated by publishing an estimate and comparing the stored total with the calc
 
 The calculator publishes 441 service definitions. `awscalc` can price:
 
-- **128 top-level services** that use standard metered-unit pricing
-- **172 of 208 sub-services** inside the 33 grouped services (S3 16/16, VPC 13/13, Backup 15/15, DynamoDB 7/8, Glue 9/9, Bedrock 13/13, Step Functions 2/2, ELB 4/4, …)
+- **161 of 163 top-level single services**
+- **33 of 33 grouped services**, with **205 of 208 sub-services**
+- PLC 2.0 instance tables (RDS family, Aurora, ElastiCache, OpenSearch, MSK, Neptune, DocumentDB, Redshift, Keyspaces, MemoryDB, …) including **Reserved Instances** (No/Partial/All Upfront)
 
-It fails loudly with `UNSUPPORTED_SERVICE` rather than returning `0` for:
+Still missing:
 
-- **EC2** instance/workload pricing
-- **PLC 2.0 pricing services**: RDS (MySQL/PostgreSQL/MariaDB/SQL Server/Oracle/Db2/Custom/Outposts), Aurora, ElastiCache, MemoryDB, MSK, Redshift, OpenSearch, Neptune, DocumentDB, Keyspaces, Timestream, Braket, GameLift, AppStream, CodeBuild, DMS, Direct Connect, Directory Service, FSx for Lustre, Elastic VMware, Managed Blockchain, Deadline Cloud, SimSpace Weaver, WorkSpaces, mainframe services
-- **16 special-widget services** (for example Data Transfer, Elemental MediaConvert outputs)
-- Data-transfer matrix widgets (`dataTransferV2`) are skipped with a warning; price transfer separately when needed
+- **Amazon EC2** (`ec2InstanceSearch`, `ec2PriceFetcher`, workload/Savings Plan widgets)
+- **Windows workloads** on EC2 (dedicated host and SQL Server license tables)
+- **WorkSpaces Personal / Thin Client / Secure Browser** monthly pricing shape
+- Direct Connect port monthly price override
+- Multi-row `columnFormIPM` tables and Database Savings Plans
+- `dataTransferV2` matrices (skipped with a warning)
+
+See [docs/COVERAGE.md](docs/COVERAGE.md) for the full status and roadmap.
 
 Run `awscalc services` for the catalog and `awscalc service <code>` for a service's supported inputs. Grouped services list their sub-services and which ones are in the calculator default.
+
+## PLC 2.0 services (RDS, Aurora, ElastiCache, MSK, …)
+
+These services use calculator instance tables instead of flat metered-unit prices. `awscalc` exposes the table row as selector inputs:
+
+```sh
+# RDS MySQL, on-demand
+awscalc price --service rds-mysql --region us-east-1 \
+  --set instanceType=db.t3.micro \
+  --set deployment=Single-AZ \
+  --set nodes=1 \
+  --set storageAmount=100GB \
+  --share
+
+# Reserved Instance: 1 year, All Upfront
+awscalc price --service rds-mysql --region us-east-1 \
+  --set instanceType=db.t3.micro \
+  --set deployment=Single-AZ \
+  --set pricingModel=Reserved \
+  --set term=1yr \
+  --set purchaseOption=All
+
+# ElastiCache cluster table (second instance table, hence the 2 suffix)
+awscalc price --service elasticache --region us-east-1 \
+  --set nodes2=2 \
+  --set instanceType2=cache.t3.micro \
+  --set engine2=Redis \
+  --set pricingModel2=OnDemand \
+  --share
+
+# MSK brokers
+awscalc price --service msk --region us-east-1 \
+  --set nodes=3 \
+  --set computeFamily=express.m7g.large
+```
+
+Aliases: `instanceType`, `computeFamily`, `nodes`, `deployment`, `pricingModel`, `term`, `purchaseOption`, `utilization`, `engine`, `instanceFamily`. For services with multiple instance tables, append the table index (`instanceType2`, `deployment2`, …). `awscalc service <code>` lists the exact aliases and available selector values for the selected region.
 
 ## Regions
 

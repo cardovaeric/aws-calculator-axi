@@ -92,7 +92,7 @@ function storageCard(extra = {}) {
   };
 }
 
-function run(def, overrides = {}, units = { "Storage GB": 0.023 }) {
+async function run(def, overrides = {}, units = { "Storage GB": 0.023 }) {
   const template = selectTemplate(def);
   const engine = new Engine({
     definition: def,
@@ -101,12 +101,12 @@ function run(def, overrides = {}, units = { "Storage GB": 0.023 }) {
     displayRegion: regionName("us-east-1"),
     maps: mapWith(units),
   });
-  engine.resolveInputs(overrides);
+  await engine.resolveInputs(overrides);
   return { engine, result: engine.evaluate() };
 }
 
-test("computes a simple price and includes defaults for rehydration", () => {
-  const { result } = run(definition({ cards: [storageCard()] }), {
+test("computes a simple price and includes defaults for rehydration", async () => {
+  const { result } = await run(definition({ cards: [storageCard()] }), {
     storage: { text: "100GB" },
   });
   assert.equal(result.monthly, 2.3);
@@ -117,8 +117,8 @@ test("computes a simple price and includes defaults for rehydration", () => {
   });
 });
 
-test("uses definition defaults when inputs are omitted", () => {
-  const { result } = run(definition({ cards: [storageCard()] }));
+test("uses definition defaults when inputs are omitted", async () => {
+  const { result } = await run(definition({ cards: [storageCard()] }));
   assert.equal(result.monthly, 0.23);
   assert.deepEqual(result.calculationComponents.storage, {
     value: "10",
@@ -126,7 +126,7 @@ test("uses definition defaults when inputs are omitted", () => {
   });
 });
 
-test("applies progressive tier pricing like the calculator", () => {
+test("applies progressive tier pricing like the calculator", async () => {
   const card = storageCard();
   card.inputSection.components = [
     card.inputSection.components[0],
@@ -161,7 +161,7 @@ test("applies progressive tier pricing like the calculator", () => {
       subTotalRefer: "cost",
     },
   ];
-  const { result } = run(
+  const { result } = await run(
     definition({ cards: [card] }),
     { storage: { text: "150GB" } },
     { "Tier 1": 1, "Tier 2": 0.5 },
@@ -170,7 +170,7 @@ test("applies progressive tier pricing like the calculator", () => {
   assert.equal(result.monthly, 125);
 });
 
-test("honours dropdown defaults and validates required inputs", () => {
+test("honours dropdown defaults and validates required inputs", async () => {
   const def = definition({
     cards: [
       {
@@ -202,16 +202,16 @@ test("honours dropdown defaults and validates required inputs", () => {
       },
     ],
   });
-  assert.throws(
+  await assert.rejects(
     () => run(def),
     (error) => error instanceof AxiError && /Missing required input/.test(error.message),
   );
-  const { engine } = run(def, { count: { text: "3" } });
+  const { engine } = await run(def, { count: { text: "3" } });
   assert.equal(engine.values.get("mode"), "b");
   assert.equal(engine.rawInputs.get("mode").value, "b");
 });
 
-test("rejects units that the component does not offer", () => {
+test("rejects units that the component does not offer", async () => {
   const def = definition({
     cards: [
       {
@@ -233,7 +233,7 @@ test("rejects units that the component does not offer", () => {
       },
     ],
   });
-  assert.throws(
+  await assert.rejects(
     () =>
       run(def, {
         requests: { text: "10millionPerMonth" },
@@ -243,7 +243,7 @@ test("rejects units that the component does not offer", () => {
   );
 });
 
-test("computes snapshot maths with the calculator formula", () => {
+test("computes snapshot maths with the calculator formula", async () => {
   const def = definition({
     cards: [
       {
@@ -309,30 +309,30 @@ test("computes snapshot maths with the calculator formula", () => {
       },
     ],
   });
-  const { result } = run(def, {}, { "Snapshot GB": 0.05 });
+  const { result } = await run(def, {}, { "Snapshot GB": 0.05 });
   // initial 100*0.05 = 5 + (10*0.05/2)*2 = 5.5
   assert.equal(result.monthly, 5.5);
 });
 
-test("reports unsupported maths and input types instead of silently returning 0", () => {
+test("reports unsupported maths and input types instead of silently returning 0", async () => {
   const def = definition({
     cards: [
       {
         title: "Main",
         inputSection: {
           components: [
-            { type: "input", subType: "columnFormIPM", id: "table", label: "Table" },
+            { type: "input", subType: "ec2InstanceSearch", id: "table", label: "Table" },
           ],
         },
         mathsSection: [],
       },
     ],
   });
-  assert.throws(
+  await assert.rejects(
     () => run(def),
     (error) =>
       error instanceof AxiError && error.code === "UNSUPPORTED_SERVICE",
   );
   const surface = supportedSurface(def);
-  assert.deepEqual(surface.unsupportedInput, ["columnFormIPM"]);
+  assert.deepEqual(surface.unsupportedInput, ["ec2InstanceSearch"]);
 });
