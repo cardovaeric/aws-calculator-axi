@@ -248,10 +248,16 @@ export function extractPrices(
       if (Number.isFinite(value)) perUnit = value;
     }
   }
+  const monthlyEntry =
+    perUnitEntry ??
+    candidates.find((entry) => /month|mo/i.test(String(entry.Unit ?? "")));
+  const monthly = Number(monthlyEntry?.price ?? 0) || 0;
   return {
     hourly: Number.isFinite(hourly) ? hourly : 0,
     upfront: Number.isFinite(upfront) ? upfront : 0,
+    monthly: Number.isFinite(monthly) ? monthly : 0,
     perUnit,
+    unit: monthlyEntry?.Unit ?? hourlyEntries[0]?.Unit ?? null,
     entries,
   };
 }

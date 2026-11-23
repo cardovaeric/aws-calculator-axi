@@ -6,6 +6,7 @@ import {
   ec2OsSelection,
   extractEc2SavingsRate,
   findEc2Instance,
+  findEc2Price,
   selectEc2Aggregation,
 } from "../src/ec2.js";
 
@@ -131,4 +132,21 @@ test("extracts a savings plan rate using the calculator key format", () => {
     }),
     null,
   );
+});
+
+
+test("reads hourly, monthly, and upfront dimensions for one instance", () => {
+  const priceIndex = {
+    regions: {
+      "US East (Ohio)": {
+        hourly: { "Instance Type": "m5.large", price: "0.06", Unit: "Hrs" },
+        upfront: { "Instance Type": "m5.large", price: "494", Unit: "Quantity" },
+      },
+    },
+  };
+  const price = findEc2Price(priceIndex, "US East (Ohio)", "m5.large");
+  assert.equal(price.hourly, 0.06);
+  assert.equal(price.upfront, 494);
+  assert.equal(price.monthly, 0);
+  assert.equal(price.entries.length, 2);
 });

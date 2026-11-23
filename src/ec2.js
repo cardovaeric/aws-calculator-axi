@@ -5,6 +5,9 @@ import { regionName } from "./regions.js";
 
 const PRICING_BASE = "https://calculator.aws/pricing/2.0/meteredUnitMaps";
 
+/** Dedicated Instance per-region fee, from the calculator's PER_REGION_FEE. */
+export const EC2_DEDICATED_PER_REGION_FEE = 2;
+
 export const EC2_OS_LABELS = {
   linux: "Linux",
   windows: "Windows",
@@ -160,6 +163,39 @@ export function ec2Entries(index, display) {
   );
 }
 
+/** Return every price dimension (Hrs + Quantity) for one instance type. */
+export function findEc2Price(index, display, instanceType) {
+  const entries = ec2Entries(index, display).filter(
+    (item) => item["Instance Type"] === instanceType,
+  );
+  if (entries.length === 0) {
+    throw new AxiError(
+      `Instance type ${instanceType} is not available in ${display}`,
+      "VALIDATION_ERROR",
+      [
+        "Instance availability differs by region and OS",
+        "Run `awscalc service ec2`, then pick an instance shown in that region",
+      ],
+    );
+  }
+  const hourlyEntry =
+    entries.find((entry) => /hour|hrs/i.test(String(entry.Unit ?? ""))) ??
+    entries.find((entry) => entry.Unit == null);
+  const upfrontEntry = entries.find((entry) =>
+    /quantity/i.test(String(entry.Unit ?? "")),
+  );
+  const monthlyEntry = entries.find((entry) =>
+    /month|mo/i.test(String(entry.Unit ?? "")),
+  );
+  return {
+    hourly: Number(hourlyEntry?.price ?? 0) || 0,
+    upfront: Number(upfrontEntry?.price ?? 0) || 0,
+    monthly: Number(monthlyEntry?.price ?? 0) || 0,
+    entry: hourlyEntry ?? upfrontEntry ?? entries[0],
+    entries,
+  };
+}
+
 export function findEc2Instance(index, display, instanceType) {
   const entry = ec2Entries(index, display).find(
     (item) => item["Instance Type"] === instanceType,
@@ -260,4 +296,64 @@ export function extractEc2SavingsRate(
   if (!hit) return null;
   const rate = Number(hit.price);
   return Number.isFinite(rate) ? rate : null;
+}
+
+/** Dedicated Host pricing lives in a sibling artifact to ec2-calc. */
+export function loadEc2HostContext({ region, currency = "USD", ...fetchOptions }) {
+  const display = regionName(region) ?? region;
+  const base = `${PRICING_BASE}/ec2/${currency}/current/dedicatedhost-calc/${encodeURIComponent(
+    display,
+  )}`;
+  return fetchJson(`${base}/primary-selector-aggregations.json`, fetchOptions).then(
+    (aggregation) => ({ base, display, aggregation, currency }),
+  );
+}
+
+/** Choose a host family (c5, m5, ...) from the dedicated host aggregation. */
+export function selectEc2HostAggregation(context, { instanceType, termType = "OnDemand" } = {}) {
+  const aggregations = context.aggregation?.aggregations ?? [];
+  const exact = aggregations.find(
+    (entry) =>
+      (entry.selectors?.TermType ?? "OnDemand") === termType &&
+      (!instanceType || entry.selectors?.["Instance Type"] === instanceType),
+  );
+  if (exact) return exact;
+  const candidates = aggregations.filter(
+    (entry) => (entry.selectors?.TermType ?? "OnDemand") === termType,
+  );
+  if (candidates.length === 0) {
+    throw new AxiError(
+      `Amazon EC2 Dedicated Hosts does not offer ${instanceType ?? "a host"} in ${context.display}`,
+      "VALIDATION_ERROR",
+    );
+  }
+  if (instanceType) {
+    const families = [
+      ...new Set(candidates.map((entry) => entry.selectors?.["Instance Type"])),
+    ].filter(Boolean);
+    throw new AxiError(
+      `Dedicated Host type ${instanceType} is not available in ${context.display}`,
+      "VALIDATION_ERROR",
+      [`Host families: ${families.slice(0, 20).join(", ")}`],
+    );
+  }
+  const valueOf = (entry) => {
+    const vcpu = Number(entry.selectors?.vCPU ?? 0);
+    if (vcpu) return vcpu;
+    return 0;
+  };
+  return candidates.reduce((best, entry) =>
+    valueOf(entry) < valueOf(best) ? entry : best,
+  );
+}
+
+export async function loadEc2HostIndex(context, aggregation, fetchOptions = {}) {
+  const selectors = aggregation.selectors ?? {};
+  const url = `${context.base}/${encodeURIComponent(
+    selectors.TermType ?? "OnDemand",
+  )}/${encodeURIComponent(selectors["Instance Type"] ?? "")}/${encodeURIComponent(
+    selectors.vCPU ?? "",
+  )}/${encodeURIComponent(selectors["Physical Cores"] ?? "")}/index.json`;
+  const data = await fetchJson(url, fetchOptions);
+  return { url, data };
 }

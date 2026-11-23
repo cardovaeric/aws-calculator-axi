@@ -85,7 +85,10 @@ export async function fetchJson(url, options = {}) {
           throw new AxiError(
             `Pricing data is unavailable (HTTP ${response.status})`,
             "UPSTREAM_ERROR",
-            ["Run `awscalc services --refresh` to reload the service catalog"],
+            [
+              url,
+              "Run `awscalc services --refresh` to reload the service catalog",
+            ],
           );
         }
         lastError = new Error(`HTTP ${response.status} for ${url}`);

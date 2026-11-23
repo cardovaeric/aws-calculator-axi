@@ -86,10 +86,18 @@ onDemandRate * hours * (1 - discount/100)
 ```text
 ec2/USD/current/dedicatedhost-calc/metadata.json
 ec2/USD/current/dedicatedhost-calc/<region>/primary-selector-aggregations.json
+ec2/USD/current/dedicatedhost-calc/<region>/OnDemand/<instance>/<vCPU>/<physicalCores>/index.json
 ec2/USD/current/dedicatedhost-calc/<region>/Reserved/<instance>/<vCPU>/<physicalCores>/index.json
 ```
 
-Not yet implemented.
+Host rows are families (`c5`, `m5`, `r5`, ...). The reserved index carries
+`Hrs` (effective hourly) and `Quantity` (upfront) dimensions for every term and
+payment option. `awscalc` uses this artifact for EC2 `tenancy=host`, and the
+same Reserved/Savings key math as shared instances.
+
+Dedicated Instances (`tenancy=dedicated`) use the normal `ec2-calc` rates plus
+the calculator's `CALCULATORS.EC2.PER_REGION_FEE` (default `$2`), charged on
+`min(totalHours, 730)` per estimate.
 
 ## EC2 calculation components
 
@@ -128,18 +136,63 @@ Only the selected strategy’s path is non-zero.
 
 Consistent workload: `totalHours = instances * 730`.
 
-Daily pattern findings from the calculator’s own breakdown:
+Spike workloads are normalized by the calculator:
 
 ```text
-baseline instances  -> baseline * 730 hours
-peak extra          -> (peak - baseline) * (hours + minutes/60)
-                       * selectedDays.length * 4.345238095238095
+daily:   per selected weekday, duration = hours + minutes/60 (cap 24 h)
+         monthly hours = weekly hours * 4.345238095238095 (cap 730)
+weekly:  duration = days * 24 + hours + minutes/60 (cap 168)
+         peak hours = peakExtra * duration * 4.345238095238095
+monthly: duration = days * 24 + hours + minutes/60 (cap 730)
+         peak hours = peakExtra * duration
 ```
 
-The calculator then runs a **cost-optimizer** that covers part of the hours with
-Savings Plans and the rest with On-Demand using a breakeven calculation, so a
-naive `hours * savingsRate` is wrong. Spike workloads are therefore still
-fail-closed.
+Baseline hours are always `baseline * 730`. Each extra instance/slot is marked
+reserved or On-Demand by comparing its monthly hours to the commitment
+breakeven:
+
+```text
+breakevenHours = ((upfront / (years * 12)) + effectiveHourly * 730)
+                 / (onDemandRate * 730) * 730
+```
+
+The resulting `reservedCount` and `onDemandHours` drive the cost outputs.
+`src/workload.js` implements this classifier and is covered by unit tests.
+
+### Data transfer
+
+`dataTransferV2` state is a list of entries:
+
+```json
+"dataTransferForEC2": { "value": [
+  { "entryType": "OUTBOUND", "value": 1, "unit": "tb_month", "toRegion": "External" }
+] }
+```
+
+- `INBOUND` is free.
+- `INTRA_REGION` uses `DataTransfer IntraRegion` and charges both directions.
+- External `OUTBOUND` uses the progressive `DataTransfer External Outbound`
+  tiers (`StartingRange`/`EndingRange` are GB).
+- Inter-region `OUTBOUND` uses `DataTransfer InterRegion Outbound to <region>`
+  and stores the destination as the `priceKey`/`toRegion` value.
+
+The CLI accepts a compact form (`OUTBOUND:1TB; INTRA_REGION:100GB`), a JSON
+array/object, or the equivalent `--input-json` value.
+
+### Additional pricing data
+
+`columnFormIPM` rows can attach a sibling PLC artifact
+(`additionalPricingData`). `awscalc` implements:
+
+- **Database Savings Plans** (`databasesavingsplans`, RDS): index path
+  `<service>/<currency>/current/<source>/<region>/<lease>/<purchase>/<deployment>/<engine>/index.json`.
+  The row's main aggregation is selected with `TermType=OnDemand`, while the
+  additional index supplies the discounted hourly rate.
+- **Dedicated Host Savings Plans** (`computesavingsplan`): path
+  `<service>/<currency>/current/compute-ec2-calc|instance-ec2-calc/<region>/Host/Linux/NA/<term>/<purchase>/index.json`.
+
+The PLC engine rounds monthly instance costs **up** to the next cent, matching
+the calculator (`98.112 -> 98.12`).
 
 ## RDS / Aurora / DocumentDB / ElastiCache / OpenSearch / MSK / Redshift
 

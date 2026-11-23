@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { AxiError } from "axi-sdk-js";
 
 import {
@@ -18,20 +20,36 @@ import {
   loadPlcIndex,
   selectAggregation,
 } from "./plc.js";
+import { regionName } from "./regions.js";
+import { fetchJson } from "./http.js";
 import {
   cheapestEc2Instance,
+  EC2_DEDICATED_PER_REGION_FEE,
   EC2_OS_LABELS,
   EC2_TENANCY_LABELS,
   ec2OsSelection,
   extractEc2SavingsRate,
   findEc2Instance,
+  findEc2Price,
   loadEc2Context,
+  loadEc2HostContext,
+  loadEc2HostIndex,
   loadEc2Index,
   loadEc2SavingsIndex,
   loadSpotAdvisor,
   selectEc2Aggregation,
+  selectEc2HostAggregation,
   spotDiscountFor,
 } from "./ec2.js";
+import {
+  breakevenHours,
+  classifyWorkload,
+  commitmentHours,
+  effectiveHourlyRate,
+  totalWorkloadHours,
+  workloadFromInputs,
+  workloadSummary,
+} from "./workload.js";
 
 const SUPPORTED_MATH = new Set([
   "basicMaths",
@@ -41,6 +59,9 @@ const SUPPORTED_MATH = new Set([
   "tieredPricingMath",
   "snapShotMaths",
   "ec2AdvPricingStrategyMath",
+  "workloadInstanceMath",
+  "workloadStorageMath",
+  "dedicatedHostsMath",
 ]);
 
 const SUPPORTED_PRICING = new Set([
@@ -72,6 +93,7 @@ const SUPPORTED_INPUT = new Set([
   "ec2InstanceSearch",
   "ec2AdvPricingStrategyV2",
   "ec2AdvPricingMetrics",
+  "dataTransferV2",
 ]);
 
 const NON_VALUE_INPUT = new Set([
@@ -82,7 +104,7 @@ const NON_VALUE_INPUT = new Set([
 ]);
 
 // CLI aliases for the single row of a columnFormIPM instance table.
-const COLUMN_ROW_ALIASES = {
+export const COLUMN_ROW_ALIASES = {
   instanceType: "Instance Type",
   nodes: "Number of Nodes",
   deployment: "Deployment Option",
@@ -98,6 +120,14 @@ const COLUMN_ROW_ALIASES = {
   portType: "port:Connection Type",
   portCapacity: "port:Capacity",
   workspaces: "Number of WorkSpaces",
+  operatingSystem: "Operating System",
+  license: "License",
+  bundleName: "Bundle Description",
+  productFamily: "Product Family",
+  rootVolume: "rootVolume",
+  userVolume: "userVolume",
+  runningMode: "Running Mode",
+  billingOption: "BillingOption",
 };
 
 function normalizeToken(value) {
@@ -131,12 +161,14 @@ function normalizePurchaseOption(option) {
 
 function normalizeEc2Strategy(text) {
   const value = String(text ?? "").toLowerCase();
+  if (value.includes("cost") || value.includes("reserved and on-demand"))
+    return "cost-optimized";
   if (value.includes("on-demand") || value.includes("ondemand")) return "on-demand";
+  if (value.includes("convertible")) return "convertible";
+  if (value.includes("reserved") || value.includes("standard")) return "standard";
   if (value.includes("compute")) return "compute-savings";
   if (value.includes("instance")) return "instance-savings";
   if (value.includes("spot")) return "spot";
-  if (value.includes("convertible")) return "convertible";
-  if (value.includes("standard")) return "standard";
   return "compute-savings";
 }
 
@@ -246,6 +278,142 @@ function parseTimeUnit(text) {
   return TIME_ALIASES[normalizeToken(text)] ?? null;
 }
 
+const DATA_UNIT_TO_GB = {
+  b: 1 / 1024 ** 3,
+  byte: 1 / 1024 ** 3,
+  bytes: 1 / 1024 ** 3,
+  kb: 1 / 1024 ** 2,
+  kib: 1 / 1024 ** 2,
+  mb: 1 / 1024,
+  mib: 1 / 1024,
+  gb: 1,
+  gib: 1,
+  tb: 1024,
+  tib: 1024,
+  pb: 1024 ** 2,
+  pib: 1024 ** 2,
+};
+
+function parseTransferUnit(value) {
+  const unit = String(value ?? "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/\/month|permonth|monthly|month/g, "");
+  return DATA_UNIT_TO_GB[unit] ?? null;
+}
+
+function parseTransferAmount(text) {
+  const raw = String(text ?? "").trim();
+  const match = raw.match(/^(-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*([a-zA-Z/]+)?/);
+  if (!match) {
+    throw new AxiError(`Could not read data transfer amount "${raw}"`, "VALIDATION_ERROR", [
+      "Use a size such as 1TB, 500GB, or 0.5tb_month",
+    ]);
+  }
+  const value = Number(match[1]);
+  const unit = parseTransferUnit(match[2] ?? "tb");
+  if (unit == null) {
+    throw new AxiError(`Unknown data transfer unit "${match[2]}"`, "VALIDATION_ERROR", [
+      "Use B, KB, MB, GB, TB, or PB",
+    ]);
+  }
+  return { value, gb: value * unit };
+}
+
+function normalizeTransferType(value) {
+  const text = String(value ?? "outbound").toLowerCase();
+  if (text.includes("intra")) return "INTRA_REGION";
+  if (text.includes("in")) return "INBOUND";
+  if (text.includes("inter")) return "OUTBOUND";
+  return "OUTBOUND";
+}
+
+/**
+ * Parse a dataTransferV2 value. Accepted forms:
+ *   "OUTBOUND:1TB; INTRA_REGION:100GB"
+ *   "OUTBOUND:1TB@us-west-2; INBOUND:2TB@eu-west-1"
+ *   "1TB" (external outbound)
+ *   a JSON array or object of transfer entries
+ */
+export function parseDataTransferEntries(value, displayRegion) {
+  if (value == null || value === "") return [];
+  const fromRaw = (entry) => {
+    const direct = entry.value ?? entry.amount ?? 0;
+    const unit = entry.unit;
+    const amountText =
+      typeof direct === "string" && /[a-z]/i.test(direct)
+        ? direct
+        : `${direct}${unit && !String(unit).includes("_month") ? unit : ""}`;
+    const amount = parseTransferAmount(amountText);
+    const gb =
+      unit === "gb_month" && typeof direct !== "string" ? Number(direct) : amount.gb;
+    return {
+      entryType: normalizeTransferType(entry.entryType ?? entry.type),
+      value: Number((gb / 1024).toFixed(6)),
+      unit: "tb_month",
+      gb,
+      fromRegion:
+        entry.fromRegion ??
+        (normalizeTransferType(entry.entryType ?? entry.type) === "INBOUND"
+          ? "External"
+          : null),
+      toRegion:
+        entry.toRegion ??
+        (normalizeTransferType(entry.entryType ?? entry.type) === "OUTBOUND"
+          ? "External"
+          : null),
+      optionType: entry.optionType?.type ?? entry.optionType ?? null,
+    };
+  };
+  if (typeof value === "object") {
+    const list = Array.isArray(value)
+      ? value
+      : Array.isArray(value.value)
+        ? value.value
+        : value.entryType
+          ? [value]
+          : [];
+    return list.map(fromRaw);
+  }
+  const text = String(value).trim();
+  if (text.startsWith("[") || text.startsWith("{")) {
+    try {
+      return parseDataTransferEntries(JSON.parse(text), displayRegion);
+    } catch (error) {
+      throw new AxiError(
+        `Could not parse data transfer JSON: ${error.message}`,
+        "VALIDATION_ERROR",
+      );
+    }
+  }
+  const specs = text.split(/[;\n]+/).map((item) => item.trim()).filter(Boolean);
+  return specs.map((spec) => {
+    let type = "OUTBOUND";
+    let region = null;
+    let amountText = spec;
+    const typed = spec.match(/^([a-zA-Z_ -]+?)\s*[:=]\s*(.+)$/);
+    if (typed) {
+      type = normalizeTransferType(typed[1]);
+      amountText = typed[2];
+    }
+    const at = amountText.match(/^(.+?)@(.+)$/);
+    if (at) {
+      amountText = at[1];
+      region = at[2];
+    }
+    const amount = parseTransferAmount(amountText);
+    return {
+      entryType: type,
+      value: Number((amount.gb / 1024).toFixed(6)),
+      unit: "tb_month",
+      gb: amount.gb,
+      fromRegion: type === "INBOUND" ? region ?? "External" : null,
+      toRegion: type === "OUTBOUND" ? region ?? "External" : null,
+      optionType: null,
+    };
+  });
+}
+
 export class Engine {
   constructor({
     definition,
@@ -274,6 +442,7 @@ export class Engine {
     this.trace = [];
     this.usedComponents = new Set();
     this.handledComponents = new Set();
+    this.hiddenComponents = new Set();
   }
 
   get units() {
@@ -383,6 +552,7 @@ export class Engine {
     if ("constant" in operand) return maybeNumber(operand.constant);
     if (operand.type === "component") {
       if (extra && Object.hasOwn(extra, operand.id)) return extra[operand.id];
+      if (this.hiddenComponents.has(operand.id)) return undefined;
       if (this.values.has(operand.id)) return this.values.get(operand.id);
       const component = this.findComponent(operand.id);
       if (component) return this.defaultInputValue(component).converted;
@@ -433,6 +603,10 @@ export class Engine {
   /** Resolve all inputs (with user overrides) and pricing lookups. */
   async resolveInputs(overrides = {}) {
     const seenOverrides = new Set();
+    if (this.definition.serviceCode === "windowsWorkloads") {
+      await this.resolveWindowsWorkloads(overrides, seenOverrides);
+      return { unknown: [] };
+    }
     let columnIndex = 0;
     const allComponents = this.cards().flatMap(
       (card) => card.inputSection?.components ?? [],
@@ -449,11 +623,19 @@ export class Engine {
       await this.resolveEc2(overrides, seenOverrides);
     }
     for (const card of this.cards()) {
-      if (!this.cardIsVisible(card)) continue;
+      if (!this.cardIsVisible(card)) {
+        for (const component of card.inputSection?.components ?? []) {
+          if (component.id) this.hiddenComponents.add(component.id);
+        }
+        continue;
+      }
       const components = card.inputSection?.components ?? [];
       for (const component of components) {
         if (this.handledComponents.has(component.id)) continue;
-        if (!this.evaluateCondition(component.displayIf, {})) continue;
+        if (!this.evaluateCondition(component.displayIf, {})) {
+          if (component.id) this.hiddenComponents.add(component.id);
+          continue;
+        }
         if (component.type === "pricing") {
           this.resolvePricing(component);
           continue;
@@ -487,8 +669,8 @@ export class Engine {
         !this.findComponent(id) &&
         !(
           hasColumnForm &&
-          /^(?:instanceType|nodes|deployment|pricingModel|term|purchaseOption|utilization)\d*$/.test(
-            id,
+          Object.keys(COLUMN_ROW_ALIASES).some(
+            (alias) => id === alias || id === `${alias}2` || id === `${alias}3`,
           )
         ) &&
         !(
@@ -514,22 +696,27 @@ export class Engine {
     );
     const bySubType = (subType) =>
       components.find((component) => component.subType === subType);
-    const tenancyComponent = bySubType("dropdown") && this.findComponent("tenancy");
+    const tenancyComponent = this.findComponent("tenancy");
     const osComponent = this.findComponent("selectedOS");
-    const workloadSelection = bySubType("radioTiles") ?? this.findComponent("workloadSelection");
-    const workloadComponent = bySubType("workload") ?? this.findComponent("workload");
+    const workloadSelection =
+      bySubType("radioTiles") ?? this.findComponent("workloadSelection");
+    const workloadComponent =
+      bySubType("workload") ?? this.findComponent("workload");
     const instanceComponent =
       bySubType("ec2InstanceSearch") ?? this.findComponent("instanceType");
     const strategyComponent =
-      bySubType("ec2AdvPricingStrategyV2") ?? this.findComponent("pricingStrategy");
+      bySubType("ec2AdvPricingStrategyV2") ??
+      this.findComponent("pricingStrategy");
     const metricsComponent =
-      bySubType("ec2AdvPricingMetrics") ?? this.findComponent("ec2AdvancedPricingMetrics");
+      bySubType("ec2AdvPricingMetrics") ??
+      this.findComponent("ec2AdvancedPricingMetrics");
     const fetcher = bySubType("ec2PriceFetcher");
     const mathComponent = this.cards()
       .flatMap((card) =>
         (card.mathsSection ?? []).flatMap((group) => group.components ?? []),
       )
       .find((component) => component.subType === "ec2AdvPricingStrategyMath");
+    const quick = !workloadComponent && Boolean(this.findComponent("quantity"));
 
     const consume = (component, aliases = []) => {
       if (!component) return undefined;
@@ -541,6 +728,19 @@ export class Engine {
       }
       return undefined;
     };
+    const consumeKey = (keys = []) => {
+      for (const key of keys) {
+        if (overrides[key] !== undefined) {
+          seenOverrides.add(key);
+          return overrides[key];
+        }
+      }
+      return undefined;
+    };
+    const textOf = (value) =>
+      value && typeof value === "object" && "text" in value
+        ? String(value.text)
+        : value;
 
     if (tenancyComponent) {
       const provided = consume(tenancyComponent);
@@ -554,16 +754,6 @@ export class Engine {
     }
 
     const tenancyValue = this.values.get("tenancy") ?? "shared";
-    if (tenancyValue !== "shared") {
-      throw new AxiError(
-        `EC2 ${tenancyValue} tenancy is not supported yet`,
-        "UNSUPPORTED_SERVICE",
-        [
-          "Only shared tenancy is implemented",
-          "Dedicated instances and Dedicated Hosts require separate pricing tables",
-        ],
-      );
-    }
     const osValue = this.values.get("selectedOS") ?? "linux";
     const tenancyLabel =
       EC2_TENANCY_LABELS[tenancyValue] ??
@@ -575,42 +765,56 @@ export class Engine {
       osOption?.label ?? EC2_OS_LABELS[osValue] ?? String(osValue);
     const osSelection = ec2OsSelection(osValue, osLabel);
 
-    const workloadType =
-      consume(workloadSelection)?.text ??
+    if (quick) {
+      await this.resolveQuickEc2({
+        overrides,
+        seenOverrides,
+        components,
+        consume,
+        consumeKey,
+        tenancyLabel,
+        osSelection,
+      });
+      return;
+    }
+
+    const workloadTypeText =
+      textOf(consume(workloadSelection)) ??
       workloadSelection?.defaultSelection ??
       "consistent";
-    if (workloadType !== "consistent") {
-      throw new AxiError(
-        `EC2 workload "${workloadType}" is not supported yet`,
-        "UNSUPPORTED_SERVICE",
-        [
-          "Use `--set workloadSelection=consistent` (constant usage)",
-          "Spike workloads need the calculator's savings/on-demand cost optimizer",
-        ],
-      );
-    }
-    const instances = asNumber(
-      consume(workloadComponent, ["instances"])?.text ??
+    const workloadExplicit = consume(workloadComponent, [
+      "workloadData",
+      "workload-json",
+    ]);
+    const rawWorkloadInputs = {
+      workloadSelection: workloadTypeText,
+      instances:
+        textOf(consume(workloadComponent, ["instances", "quantity"])) ??
+        textOf(consumeKey(["instances", "quantity"])) ??
         workloadComponent?.defaultValue ??
         1,
-    );
-    const totalHours = instances * 730;
-    const workloadData = { workloadType, data: String(instances) };
+      workload: textOf(workloadExplicit),
+      baseline: textOf(consumeKey(["baseline"])),
+      peak: textOf(consumeKey(["peak"])),
+      spikeDays: textOf(consumeKey(["spikeDays", "days"])),
+      spikeHours: textOf(consumeKey(["spikeHours", "hours"])),
+      spikeMinutes: textOf(consumeKey(["spikeMinutes", "minutes"])),
+      workloadDays: textOf(consumeKey(["workloadDays", "selectedDays"])),
+    };
+    const workload = workloadFromInputs(rawWorkloadInputs);
 
     const strategyText =
-      consume(strategyComponent)?.text ??
+      textOf(consume(strategyComponent)) ??
       strategyComponent?.defaultValue ??
       "compute-savings";
-    const termText =
-      overrides.term?.text ?? "3 Year";
-    const upfrontText =
-      overrides.upfront?.text ?? "None";
+    const termText = textOf(consumeKey(["term"])) ?? "3 Year";
+    const upfrontText = textOf(consumeKey(["upfront"])) ?? "None";
     seenOverrides.add("term");
     seenOverrides.add("upfront");
 
     const strategy = normalizeEc2Strategy(strategyText);
     if (
-      !/on-?demand|compute|instance|spot|standard|convertible/i.test(
+      !/on-?demand|compute|instance|spot|standard|convertible|cost|reserved/i.test(
         String(strategyText),
       )
     ) {
@@ -618,22 +822,439 @@ export class Engine {
         `Unknown EC2 pricing strategy "${strategyText}"`,
         "VALIDATION_ERROR",
         [
-          "Use on-demand, compute-savings, instance-savings (standard/convertible/spot are not supported yet)",
-        ],
-      );
-    }
-    if (strategy === "standard" || strategy === "convertible") {
-      throw new AxiError(
-        `EC2 pricing strategy "${strategyText}" is not supported yet`,
-        "UNSUPPORTED_SERVICE",
-        [
-          "Reserved Instances are not implemented",
-          "Use on-demand, compute-savings, instance-savings, or spot",
+          "Use on-demand, compute-savings, instance-savings, cost-optimized, standard, convertible, or spot",
         ],
       );
     }
     const term = normalizeEc2Term(termText);
     const purchaseOption = normalizePurchaseOption(upfrontText);
+    const reservedTerm = strategy === "standard" || strategy === "convertible"
+      ? strategy
+      : strategy === "cost-optimized"
+        ? "standard"
+        : null;
+    const needsReserved = Boolean(reservedTerm);
+    const needsSavings =
+      strategy === "compute-savings" || strategy === "instance-savings";
+
+    const instanceProvided = textOf(consume(instanceComponent));
+    const isHost = tenancyValue === "host";
+
+    let onDemandRate = 0;
+    let instanceType;
+    let reservedPrice = null;
+    let savingsRate = null;
+    let spotDiscount = 0;
+    let display = this.displayRegion;
+
+    if (isHost) {
+      const hostContext = await loadEc2HostContext({
+        region: this.region,
+        currency: this.currency,
+        ...this.fetchOptions,
+      });
+      display = hostContext.display;
+      const onDemandAgg = selectEc2HostAggregation(hostContext, {
+        instanceType: instanceProvided,
+        termType: "OnDemand",
+      });
+      instanceType = onDemandAgg.selectors["Instance Type"];
+      const { data: onDemandIndex } = await loadEc2HostIndex(
+        hostContext,
+        onDemandAgg,
+        this.fetchOptions,
+      );
+      onDemandRate = findEc2Price(onDemandIndex, display, instanceType).hourly;
+      if (needsReserved) {
+        const reservedAgg = selectEc2HostAggregation(hostContext, {
+          instanceType,
+          termType: "Reserved",
+        });
+        const { data: reservedIndex } = await loadEc2HostIndex(
+          hostContext,
+          reservedAgg,
+          this.fetchOptions,
+        );
+        const all = findEc2Price(reservedIndex, display, instanceType);
+        reservedPrice = this.pickReservedOption(all.entries, {
+          term,
+          purchaseOption,
+          offering: reservedTerm,
+        });
+      }
+      if (needsSavings) {
+        const savingsIndex = await loadEc2SavingsIndex(
+          hostContext,
+          {
+            kind: strategy,
+            term,
+            purchaseOption,
+            os: "Linux",
+            preInstalled: "NA",
+            tenancy: "Host",
+          },
+          this.fetchOptions,
+        );
+        savingsRate = extractEc2SavingsRate(savingsIndex, display, {
+          kind: strategy,
+          term,
+          purchaseOption,
+          instanceType,
+        });
+        if (savingsRate == null) {
+          throw new AxiError(
+            `No ${strategy} Savings Plan rate found for ${instanceType} in ${display}`,
+            "VALIDATION_ERROR",
+            ["Try --set pricingStrategy=on-demand"],
+          );
+        }
+      }
+    } else {
+      const context = await loadEc2Context({
+        region: this.region,
+        currency: this.currency,
+        ...this.fetchOptions,
+      });
+      display = context.display;
+      const selected = selectEc2Aggregation(context, {
+        tenancy: tenancyLabel,
+        os: osSelection.os,
+        preInstalled: osSelection.preInstalled,
+        termType: "OnDemand",
+      });
+      const { data: indexData } = await loadEc2Index(
+        context,
+        selected.aggregation,
+        this.fetchOptions,
+      );
+      const instanceEntry = instanceProvided
+        ? findEc2Instance(indexData, display, instanceProvided)
+        : cheapestEc2Instance(indexData, display);
+      instanceType = instanceEntry["Instance Type"];
+      onDemandRate = Number(instanceEntry.price) || 0;
+
+      if (needsReserved) {
+        const reservedSelected = selectEc2Aggregation(context, {
+          tenancy: tenancyLabel,
+          os: osSelection.os,
+          preInstalled: osSelection.preInstalled,
+          termType: "Reserved",
+          lease: `${term}yr`,
+          purchase: purchaseOption,
+          offering: reservedTerm,
+        });
+        const { data: reservedIndex } = await loadEc2Index(
+          context,
+          reservedSelected.aggregation,
+          this.fetchOptions,
+        );
+        const all = findEc2Price(reservedIndex, display, instanceType);
+        reservedPrice = {
+          hourly: all.hourly,
+          upfront: all.upfront,
+          monthly: all.hourly * 730,
+        };
+      }
+
+      if (needsSavings) {
+        const savingsIndex = await loadEc2SavingsIndex(
+          context,
+          {
+            kind: strategy,
+            term,
+            purchaseOption,
+            os: osSelection.os,
+            preInstalled: osSelection.preInstalled,
+            tenancy: tenancyLabel,
+          },
+          this.fetchOptions,
+        );
+        savingsRate = extractEc2SavingsRate(savingsIndex, display, {
+          kind: strategy,
+          term,
+          purchaseOption,
+          instanceType,
+        });
+        if (savingsRate == null) {
+          throw new AxiError(
+            `No ${strategy} Savings Plan rate found for ${instanceType} in ${display}`,
+            "VALIDATION_ERROR",
+            ["Try --set pricingStrategy=on-demand"],
+          );
+        }
+      }
+    }
+
+    if (strategy === "spot") {
+      const advisor = await loadSpotAdvisor(this.fetchOptions);
+      spotDiscount = spotDiscountFor(advisor, {
+        region: this.region,
+        os: osSelection.os,
+        instanceType,
+      });
+    }
+
+    const totalHours = totalWorkloadHours(workload, 0);
+    const perRegionFeeHours =
+      isHost || tenancyValue !== "dedicated" ? 0 : Math.min(totalHours, 730);
+    const perRegionFee = perRegionFeeHours * EC2_DEDICATED_PER_REGION_FEE;
+
+    const costs = {
+      onDemandCost: 0,
+      upfrontCost: 0,
+      monthlyCost: 0,
+      instanceSavingsCost: 0,
+      computeSavingsCost: 0,
+      totalHours,
+    };
+    let summaryLabel = "On-Demand";
+    let savingsPlanUpfront = 0;
+    let savingsPlanMonthly = 0;
+
+    if (needsSavings) {
+      const years = term;
+      const upfrontCost = this.savingsPlanUpfront(
+        savingsRate,
+        years,
+        purchaseOption,
+      );
+      const effective = effectiveHourlyRate(years, savingsRate, upfrontCost);
+      savingsPlanUpfront = upfrontCost;
+      savingsPlanMonthly = effective * 730;
+      const breakeven = breakevenHours({
+        termYears: years,
+        upfrontCost,
+        monthlyCost: savingsPlanMonthly,
+        effectiveRate: effective,
+        onDemandRate,
+      });
+      const utilization = classifyWorkload(workload, breakeven);
+      const reservedCost = utilization.reservedCount * savingsPlanMonthly;
+      const onDemandCost = utilization.onDemandHours * onDemandRate;
+      costs.onDemandCost = roundHalfUp(onDemandCost, 2);
+      costs.upfrontCost = roundHalfUp(utilization.reservedCount * upfrontCost, 2);
+      if (strategy === "compute-savings") costs.computeSavingsCost = roundHalfUp(reservedCost, 2);
+      else costs.instanceSavingsCost = roundHalfUp(reservedCost, 2);
+      summaryLabel =
+        strategy === "instance-savings"
+          ? `EC2 Instance Savings Plans ${term}yr ${purchaseOption}`
+          : `Compute Savings Plans ${term}yr ${purchaseOption}`;
+    } else if (strategy === "on-demand") {
+      costs.onDemandCost = roundHalfUp(onDemandRate * totalHours + perRegionFee, 2);
+      summaryLabel = "On-Demand";
+    } else if (strategy === "spot") {
+      const discounted = onDemandRate * totalHours * (1 - spotDiscount / 100);
+      costs.onDemandCost = roundHalfUp(discounted + perRegionFee, 2);
+      summaryLabel = `Spot Discount: ${spotDiscount}`;
+    } else if (strategy === "cost-optimized") {
+      const breakeven = breakevenHours({
+        termYears: term,
+        upfrontCost: reservedPrice?.upfront ?? 0,
+        monthlyCost: reservedPrice?.monthly ?? 0,
+        onDemandRate,
+      });
+      const utilization = classifyWorkload(workload, breakeven);
+      const reservedCost = utilization.reservedCount * (reservedPrice?.monthly ?? 0);
+      const onDemandCost = utilization.onDemandHours * onDemandRate;
+      costs.onDemandCost = roundHalfUp(onDemandCost, 2);
+      costs.upfrontCost = roundHalfUp(
+        utilization.reservedCount * (reservedPrice?.upfront ?? 0),
+        2,
+      );
+      costs.monthlyCost = roundHalfUp(reservedCost, 2);
+      summaryLabel = `Reserved ${term}yr ${purchaseOption} (cost optimized)`;
+    } else {
+      // Standard and Convertible Reserved Instances run everything reserved.
+      const utilization = classifyWorkload(workload, 0);
+      const count =
+        workload.workloadType === "consistent"
+          ? Number(utilization.reservedCount) || 0
+          : Number(utilization.reservedCount) || 0;
+      costs.monthlyCost = roundHalfUp(
+        count * (reservedPrice?.monthly ?? 0) + perRegionFee,
+        2,
+      );
+      costs.upfrontCost = roundHalfUp(count * (reservedPrice?.upfront ?? 0), 2);
+      summaryLabel = `${strategy === "convertible" ? "Convertible" : "Standard"} Reserved Instances ${term}yr ${purchaseOption}`;
+    }
+
+    this.values.set("totalHours", totalHours);
+    if (mathComponent) this.values.set(mathComponent.id, costs);
+    if (fetcher) {
+      this.handledComponents.add(fetcher.id);
+      this.pricingValues.set(fetcher.id, {
+        kind: "ec2PriceFetcher",
+        onDemandRate,
+        savingsRate,
+        instanceType,
+        tenancy: tenancyValue,
+      });
+      this.values.set(fetcher.id, onDemandRate);
+    }
+
+    const strategyState =
+      strategy === "spot"
+        ? { selectedOption: "spot", spotDiscountPercentage: String(spotDiscount) }
+        : strategy === "on-demand"
+          ? {
+              selectedOption: "on-demand",
+              term: "1 year",
+              utilizationValue: "100",
+              utilizationUnit: "%Utilized/Month",
+            }
+          : strategy === "standard" || strategy === "convertible"
+            ? {
+                selectedOption: strategy,
+                term: `${term} Year`,
+                upfrontPayment:
+                  purchaseOption === "No Upfront" ? "None" : purchaseOption,
+                model: strategy === "convertible" ? "Yes" : "No",
+              }
+            : {
+                selectedOption: strategy,
+                term: `${term} Year`,
+                upfrontPayment:
+                  purchaseOption === "No Upfront" ? "None" : purchaseOption,
+                model:
+                  strategy === "instance-savings"
+                    ? "instanceSavings"
+                    : strategy === "compute-savings"
+                      ? "computeSavings"
+                      : "No",
+              };
+    if (workloadComponent) {
+      this.rawInputs.set(workloadComponent.id, { value: workload });
+      this.handledComponents.add(workloadComponent.id);
+    }
+    if (workloadSelection) {
+      this.rawInputs.set(workloadSelection.id, {
+        value: workload.workloadType,
+      });
+      this.handledComponents.add(workloadSelection.id);
+    }
+    if (instanceComponent) {
+      this.rawInputs.set(instanceComponent.id, { value: instanceType });
+      this.handledComponents.add(instanceComponent.id);
+    }
+    if (strategyComponent) {
+      this.rawInputs.set(strategyComponent.id, { value: strategyState });
+      this.handledComponents.add(strategyComponent.id);
+    }
+    if (metricsComponent) {
+      this.values.set(metricsComponent.id, 1);
+      this.rawInputs.set(metricsComponent.id, { value: 1 });
+      this.handledComponents.add(metricsComponent.id);
+    }
+    if (savingsPlanUpfront || savingsPlanMonthly) {
+      this.values.set("ec2SavingsPlanUpfront", savingsPlanUpfront);
+      this.values.set("ec2SavingsPlanMonthly", savingsPlanMonthly);
+    }
+
+    this.summary.push({
+      id: "workload",
+      label: "Workload",
+      text: workloadSummary(workload),
+    });
+    this.summary.push({
+      id: instanceComponent?.id ?? "instanceType",
+      label: instanceComponent?.label ?? "Advance EC2 instance",
+      text: `${instanceComponent?.label ?? "Advance EC2 instance"} (${instanceType})`,
+    });
+    this.summary.push({
+      id: strategyComponent?.id ?? "pricingStrategy",
+      label: strategyComponent?.label ?? "Pricing strategy",
+      text: `Pricing strategy (${summaryLabel})`,
+    });
+  }
+
+  pickReservedOption(entries, { term, purchaseOption, offering }) {
+    const termValue = `${term}yr`;
+    const offeringValue = offering === "convertible" ? "convertible" : "standard";
+    const matches = (entry) => {
+      const lease = normalizeTerm(entry.LeaseContractLength ?? "");
+      const purchase = normalizeToken(entry.PurchaseOption ?? "");
+      const desiredPurchase = normalizeToken(purchaseOption);
+      const offeringClass = entry.OfferingClass;
+      return (
+        lease === termValue &&
+        purchase === desiredPurchase &&
+        (offeringClass == null ||
+          normalizeToken(offeringClass) === normalizeToken(offeringValue))
+      );
+    };
+    const hourly = entries.filter(
+      (entry) => matches(entry) && /hour|hrs/i.test(String(entry.Unit ?? "")),
+    );
+    const upfront = entries.filter(
+      (entry) => matches(entry) && /quantity/i.test(String(entry.Unit ?? "")),
+    );
+    return {
+      hourly: Number(hourly[0]?.price ?? 0) || 0,
+      upfront: Number(upfront[0]?.price ?? 0) || 0,
+      monthly: (Number(hourly[0]?.price ?? 0) || 0) * 730,
+    };
+  }
+
+  savingsPlanUpfront(rate, years, purchaseOption) {
+    const hours = commitmentHours(years);
+    const fraction =
+      purchaseOption === "All Upfront"
+        ? 1
+        : purchaseOption === "Partial Upfront"
+          ? 0.5
+          : 0;
+    return roundHalfUp(Number(rate) * hours * fraction, 2);
+  }
+
+  async resolveQuickEc2({
+    overrides,
+    seenOverrides,
+    components,
+    consume,
+    consumeKey,
+    tenancyLabel,
+    osSelection,
+  }) {
+    const textOf = (value) =>
+      value && typeof value === "object" && "text" in value
+        ? String(value.text)
+        : value;
+    const instanceComponent = components.find(
+      (component) => component.subType === "instanceFinder",
+    );
+    const strategyComponent = components.find(
+      (component) => component.subType === "pricingStrategy",
+    );
+    const quantityComponent = components.find(
+      (component) => component.id === "quantity",
+    );
+    const utilizationComponent = components.find(
+      (component) => component.id === "utilization",
+    );
+    const instanceProvided = consume(instanceComponent);
+    const quantityText =
+      consume(quantityComponent)?.text ?? quantityComponent?.defaultValue ?? 1;
+    const utilizationText =
+      consume(utilizationComponent)?.text ??
+      utilizationComponent?.defaultValue ??
+      100;
+    const quantity = Math.max(1, asNumber(quantityText));
+    const utilization = Math.max(0, asNumber(utilizationText));
+
+    const strategyValue = normalizeEc2Strategy(
+      textOf(consume(strategyComponent)) ??
+        strategyComponent?.radioGroups?.[0]?.defaultOption ??
+        "instanceSavings",
+    );
+    const radioGroups = strategyComponent?.radioGroups ?? [];
+    const termGroup = radioGroups.find((group) => group.value === "term");
+    const paymentGroup = radioGroups.find((group) => group.value === "options");
+    const term = normalizeEc2Term(
+      textOf(consumeKey(["term"])) ?? termGroup?.defaultOption ?? "3yr",
+    );
+    const purchaseOption = normalizePurchaseOption(
+      textOf(consumeKey(["upfront"])) ?? paymentGroup?.defaultOption ?? "NoUpfront",
+    );
 
     const context = await loadEc2Context({
       region: this.region,
@@ -651,36 +1272,34 @@ export class Engine {
       selected.aggregation,
       this.fetchOptions,
     );
-    const instanceProvided = consume(instanceComponent);
-    const instanceEntry = instanceProvided?.text
-      ? findEc2Instance(indexData, context.display, instanceProvided.text)
+    const instanceEntry = instanceProvided
+      ? findEc2Instance(indexData, context.display, instanceProvided)
       : cheapestEc2Instance(indexData, context.display);
     const instanceType = instanceEntry["Instance Type"];
     const onDemandRate = Number(instanceEntry.price) || 0;
 
+    const reservedSelected = selectEc2Aggregation(context, {
+      tenancy: tenancyLabel,
+      os: osSelection.os,
+      preInstalled: osSelection.preInstalled,
+      termType: "Reserved",
+      lease: `${term}yr`,
+      purchase: purchaseOption,
+      offering: "standard",
+    });
+    const { data: reservedIndex } = await loadEc2Index(
+      context,
+      reservedSelected.aggregation,
+      this.fetchOptions,
+    );
+    const reserved = findEc2Price(reservedIndex, context.display, instanceType);
 
-    let savingsRate = null;
-    let spotDiscount = 0;
-    if (strategy === "spot") {
-      const advisor = await loadSpotAdvisor(this.fetchOptions);
-      spotDiscount = spotDiscountFor(advisor, {
-        region: this.region,
-        os: osSelection.os,
-        instanceType,
-      });
-    }
-    if (strategy === "compute-savings" || strategy === "instance-savings") {
-      if (purchaseOption !== "No Upfront") {
-        throw new AxiError(
-          `EC2 Savings Plans with ${purchaseOption} are not supported yet`,
-          "UNSUPPORTED_SERVICE",
-          ["Use `--set upfront=None` (No Upfront)"],
-        );
-      }
+    const savingsRates = {};
+    for (const kind of ["compute-savings", "instance-savings"]) {
       const savingsIndex = await loadEc2SavingsIndex(
         context,
         {
-          kind: strategy,
+          kind,
           term,
           purchaseOption,
           os: osSelection.os,
@@ -689,131 +1308,624 @@ export class Engine {
         },
         this.fetchOptions,
       );
-      savingsRate = extractEc2SavingsRate(savingsIndex, context.display, {
-        kind: strategy,
-        term,
-        purchaseOption,
-        instanceType,
-      });
-      if (savingsRate == null) {
-        throw new AxiError(
-          `No ${strategy} Savings Plan rate found for ${instanceType} in ${context.display}`,
-          "VALIDATION_ERROR",
-          ["Try --set pricingStrategy=on-demand"],
-        );
-      }
+      savingsRates[kind] =
+        extractEc2SavingsRate(savingsIndex, context.display, {
+          kind,
+          term,
+          purchaseOption,
+          instanceType,
+        }) ?? 0;
     }
+    const savingsUpfront = (rate) =>
+      this.savingsPlanUpfront(rate, term, purchaseOption);
+    const savingsEffective = (rate) =>
+      effectiveHourlyRate(term, rate, savingsUpfront(rate));
 
-    const spotCost =
-      strategy === "spot"
-        ? onDemandRate * totalHours * (1 - spotDiscount / 100)
-        : 0;
-    const coveredInstances = Math.floor(totalHours / 730);
-    const coveredHours = coveredInstances * 730;
-    const uncoveredHours = totalHours - coveredHours;
-    const savingsCoveredCost =
-      coveredHours * (savingsRate ?? onDemandRate);
-    const uncoveredOnDemandCost = uncoveredHours * onDemandRate;
-    const costs = {
-      onDemandCost:
-        strategy === "on-demand"
-          ? onDemandRate * totalHours
-          : strategy === "spot"
-            ? spotCost
-            : uncoveredOnDemandCost,
-      upfrontCost: 0,
-      monthlyCost: 0,
-      instanceSavingsCost:
-        strategy === "instance-savings" ? savingsCoveredCost : 0,
-      computeSavingsCost:
-        strategy === "compute-savings" ? savingsCoveredCost : 0,
-      totalHours,
+    const prices = components.filter(
+      (component) =>
+        component.type === "input" &&
+        component.subType === "priceSelector" &&
+        component.id?.startsWith("quickEstimate_generated_"),
+    );
+    const rateByLabel = {
+      upfront: reserved.upfront,
+      reserved: reserved.hourly,
+      instance: savingsEffective(savingsRates["instance-savings"]),
+      ondemand: onDemandRate,
+      compute: savingsEffective(savingsRates["compute-savings"]),
     };
-    this.values.set("totalHours", totalHours);
-    if (mathComponent) this.values.set(mathComponent.id, costs);
-    if (fetcher) {
-      this.handledComponents.add(fetcher.id);
-      this.pricingValues.set(fetcher.id, {
-        kind: "ec2PriceFetcher",
-        onDemandRate,
-        savingsRate,
-        instanceType,
-        instanceEntry,
-      });
-      this.values.set(fetcher.id, onDemandRate);
+    for (const component of prices) {
+      const label = String(component.label ?? "").toLowerCase();
+      let value = 0;
+      if (label.includes("upfront")) value = rateByLabel.upfront;
+      else if (label.includes("reserved")) value = rateByLabel.reserved;
+      else if (label.includes("instance savings")) value = rateByLabel.instance;
+      else if (label.includes("ondemand") || label.includes("on-demand"))
+        value = rateByLabel.ondemand;
+      else if (label.includes("compute savings")) value = rateByLabel.compute;
+      this.values.set(component.id, value);
+      this.rawInputs.set(component.id, { value });
+      this.handledComponents.add(component.id);
     }
 
-    const strategyState =
-      strategy === "spot"
-        ? {
-            selectedOption: "spot",
-            spotDiscountPercentage: String(spotDiscount),
-          }
-        : strategy === "on-demand"
-          ? {
-              selectedOption: "on-demand",
-              term: "1 year",
-              utilizationValue: "100",
-              utilizationUnit: "%Utilized/Month",
-            }
-          : {
-              selectedOption: strategy,
-              term: `${term} Year`,
-              upfrontPayment:
-                purchaseOption === "No Upfront" ? "None" : purchaseOption,
-              model:
-                strategy === "instance-savings"
-                  ? "instanceSavings"
-                  : "computeSavings",
-            };
-    if (workloadComponent) {
-      this.rawInputs.set(workloadComponent.id, { value: workloadData });
-      this.handledComponents.add(workloadComponent.id);
-    }
-    if (workloadSelection) {
-      this.rawInputs.set(workloadSelection.id, { value: workloadType });
-      this.handledComponents.add(workloadSelection.id);
+    const strategyText = textOf(consume(strategyComponent));
+    const selectedOption = strategyText ?? strategyValue;
+    const quickState = {
+      model: strategyValue,
+      term: `${term}yr`,
+      options: purchaseOption,
+    };
+    if (strategyComponent) {
+      this.rawInputs.set(strategyComponent.id, { value: quickState });
+      this.handledComponents.add(strategyComponent.id);
     }
     if (instanceComponent) {
       this.rawInputs.set(instanceComponent.id, { value: instanceType });
       this.handledComponents.add(instanceComponent.id);
     }
-    if (strategyComponent) {
-      this.rawInputs.set(strategyComponent.id, { value: strategyState });
-      this.handledComponents.add(strategyComponent.id);
+    if (quantityComponent) {
+      // Leave calculationComponents to the normal input resolver.
+      seenOverrides.delete(quantityComponent.id);
     }
-    if (metricsComponent) {
-      this.values.set(metricsComponent.id, 1);
-      this.rawInputs.set(metricsComponent.id, { value: 1 });
-      this.handledComponents.add(metricsComponent.id);
+    if (utilizationComponent) {
+      seenOverrides.delete(utilizationComponent.id);
     }
 
-    const strategyLabel =
-      strategy === "on-demand"
-        ? "On-Demand"
-        : strategy === "spot"
-          ? `Spot Discount: ${spotDiscount}`
-          : strategy === "instance-savings"
-            ? `EC2 Instance Savings Plans ${term}yr ${purchaseOption}`
-            : `Compute Savings Plans ${term}yr ${purchaseOption}`;
-    this.summary.push({
-      id: "workload",
-      label: "Workload",
-      text:
-        workloadType === "consistent"
-          ? `Workload (Consistent, Number of instances: ${instances})`
-          : `Workload (${workloadType[0].toUpperCase()}${workloadType.slice(1)}, Baseline: ${baseline}, Peak: ${peak}, Duration of peak: ${peakDays} Day ${peakHours} Hr ${peakMinutes} Min)`,
-    });
     this.summary.push({
       id: instanceComponent?.id ?? "instanceType",
-      label: instanceComponent?.label ?? "Advance EC2 instance",
-      text: `${instanceComponent?.label ?? "Advance EC2 instance"} (${instanceType})`,
+      label: instanceComponent?.label ?? "Instance type",
+      text: `${instanceComponent?.label ?? "Instance type"} (${instanceType})`,
     });
     this.summary.push({
       id: strategyComponent?.id ?? "pricingStrategy",
       label: strategyComponent?.label ?? "Pricing strategy",
-      text: `Pricing strategy (${strategyLabel})`,
+      text: `Pricing strategy (${selectedOption})`,
     });
+    this.values.set("totalHours", quantity * utilization);
+  }
+
+  findAdditionalPricingItem(component, termType, name) {
+    const items = component.additionalPricingData ?? [];
+    return items.find((item) => {
+      const constantTerm = item.remap?.constant?.TermType;
+      if (constantTerm && normalizeToken(constantTerm) === normalizeToken(termType)) {
+        return true;
+      }
+      return name && normalizeToken(item.name) === normalizeToken(name);
+    });
+  }
+
+  /**
+   * Resolve a Database Savings Plan or compute/instance Savings Plan index for
+   * a columnFormIPM row. These live in sibling pricing artifacts.
+   */
+  async loadAdditionalPricing(item, options = {}) {
+    const source = item.manifest?.source;
+    const serviceId = item.manifest?.serviceId;
+    if (!source || !serviceId) return null;
+    const display = encodeURIComponent(this.displayRegion);
+    const base = "https://calculator.aws/pricing/2.0/meteredUnitMaps";
+    const findRate = (data, instanceType) => {
+      const region =
+        data?.regions?.[this.displayRegion] ??
+        Object.values(data?.regions ?? {})[0] ??
+        {};
+      const entries = Object.entries(region);
+      const hit =
+        entries.find(([, entry]) =>
+          Object.entries(entry ?? {}).some(
+            ([key, value]) =>
+              key.endsWith("InstanceType") ||
+              key === "Instance Type" ||
+              key === "rds:Instance Type"
+                ? value === instanceType
+                : false,
+          ),
+        ) ??
+        entries.find(([key]) => key.includes(` ${instanceType} `)) ??
+        entries.find(([, entry]) => entry?.InstanceFamily === instanceType);
+      if (!hit) return null;
+      const price = Number(hit[1]?.price);
+      return Number.isFinite(price) ? price : null;
+    };
+
+    try {
+      if (/^databasesavingsplans$/i.test(serviceId)) {
+        const lease =
+          options.term === "3yr" ? "3 years" : "1 year";
+        const path = [
+          base,
+          serviceId,
+          this.currency,
+          "current",
+          source,
+          display,
+          encodeURIComponent(lease),
+          encodeURIComponent(options.purchaseOption ?? "No Upfront"),
+          encodeURIComponent(options.deployment ?? "Single-AZ"),
+          encodeURIComponent(options.databaseEngine ?? "MySQL"),
+          "index.json",
+        ].join("/");
+        const data = await fetchJson(path, this.fetchOptions);
+        const rate = findRate(data, options.instanceType);
+        if (rate == null) return null;
+        return { rate, kind: "savings" };
+      }
+      if (/^computesavingsplan$/i.test(serviceId)) {
+        const artifactSource = /instance/i.test(item.name)
+          ? "instance-ec2-calc"
+          : "compute-ec2-calc";
+        const path = [
+          base,
+          serviceId,
+          this.currency,
+          "current",
+          artifactSource,
+          display,
+          "Host",
+          "Linux",
+          "NA",
+          String(options.termYears ?? 3),
+          encodeURIComponent(options.purchaseOption ?? "No Upfront"),
+          "index.json",
+        ].join("/");
+        const data = await fetchJson(path, this.fetchOptions);
+        const rate = findRate(data, options.instanceType);
+        if (rate == null) return null;
+        return { rate, kind: "savings" };
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  /** Price the Windows Server and SQL Server workload calculator (shared tenancy). */
+  async resolveWindowsWorkloads(overrides, seenOverrides) {
+    const components = this.cards().flatMap(
+      (card) => card.inputSection?.components ?? [],
+    );
+    const find = (id) => components.find((component) => component.id === id);
+    const take = (keys, fallback) => {
+      for (const key of keys) {
+        if (overrides[key] !== undefined) {
+          seenOverrides.add(key);
+          return overrides[key]?.value ?? overrides[key]?.text;
+        }
+      }
+      return fallback;
+    };
+    const bool = (value, fallback) => {
+      if (value === undefined || value === null || value === "") return fallback;
+      if (typeof value === "boolean") return value;
+      return /^(true|yes|y|1|on)$/i.test(String(value));
+    };
+    const machineId = String(take(["machineId"], "machine1"));
+    const quantity = Math.max(1, asNumber(take(["quantity", "instances"], 1)));
+    const description = String(
+      take(["machineDescription", "description"], "Server 1"),
+    );
+    const cpu = asNumber(take(["cpuInput", "vcpus", "cpu"], 4));
+    const memory = asNumber(take(["memoryInput", "memory"], 16));
+    const passive = asNumber(take(["machineSpecificationSqlPassiveNode"], 0));
+    const optimizeCpus = asNumber(take(["optimizeCpus"], cpu));
+
+    const bringWindows = bool(
+      take(["bringWindowsLicense"], undefined),
+      find("bringWindowsLicense")?.defaultValue ?? false,
+    );
+    const bringSQL = bool(
+      take(["bringSQLLicense"], undefined),
+      find("sqlLicenseCheckboxes")?.options?.find((o) => o.id === "bringSQLLicense")
+        ?.prechecked ?? true,
+    );
+    const haveSA = bool(
+      take(["haveSoftwareAssurance"], undefined),
+      find("sqlLicenseCheckboxes")?.options?.find(
+        (o) => o.id === "haveSoftwareAssurance",
+      )?.prechecked ?? true,
+    );
+
+    const workflow = String(take(["workflow"], "shared"));
+    if (workflow !== "shared") {
+      throw new AxiError(
+        "Windows workload dedicated-host workflow is not supported yet",
+        "UNSUPPORTED_SERVICE",
+        [
+          "Use --set workflow=shared",
+          "Use the EC2 `tenancy=host` mode for dedicated host pricing",
+        ],
+      );
+    }
+
+    const osId = String(
+      take(["operatingSystem", "machineSpecificationOperatingSystem"], null) ??
+        (bringWindows ? "windows-byol" : "windows-li"),
+    );
+    const defaultSql = bringSQL && haveSA ? "std-byol" : "std-li";
+    const sqlId = String(
+      take(
+        ["sqlServerVersion", "machineSpecificationSQLServerVersion", "sql"],
+        null,
+      ) ?? defaultSql,
+    );
+    if (/developer/i.test(sqlId)) {
+      throw new AxiError(
+        "SQL Server Developer edition is not supported by the calculator price index",
+        "UNSUPPORTED_SERVICE",
+      );
+    }
+    const sqlByol = /-byol$/i.test(sqlId) || sqlId === "no-sql";
+    const sqlPreinstalled = sqlByol
+      ? "NA"
+      : /enterprise/i.test(sqlId)
+        ? "SQL Ent"
+        : /web/i.test(sqlId)
+          ? "SQL Web"
+          : "SQL Std";
+    const osMap = {
+      "windows-li": ["Windows", sqlPreinstalled],
+      "windows-byol": ["Linux", sqlPreinstalled],
+      linux: ["Linux", sqlPreinstalled],
+      rhel: ["RHEL", sqlPreinstalled],
+      suse: ["SUSE", sqlPreinstalled],
+    };
+    const [ec2Os, preInstalled] = osMap[osId] ?? ["Windows", sqlPreinstalled];
+
+    const strategyText = String(
+      take(["pricingStrategy", "pricingModel"], null) ?? "reserved",
+    );
+    const strategy = normalizeEc2Strategy(strategyText);
+    const term = normalizeEc2Term(
+      String(take(["term"], null) ?? "1 Year"),
+    );
+    const purchaseOption = normalizePurchaseOption(
+      String(take(["upfront"], null) ?? "No Upfront"),
+    );
+    const instanceProvided = take(
+      [
+        "instanceType",
+        "instanceTypeSearch",
+        "machineSpecificationInstanceType",
+      ],
+      null,
+    );
+
+    const context = await loadEc2Context({
+      region: this.region,
+      currency: this.currency,
+      ...this.fetchOptions,
+    });
+    const onDemandAgg = selectEc2Aggregation(context, {
+      tenancy: "Shared",
+      os: ec2Os,
+      preInstalled,
+      termType: "OnDemand",
+    });
+    const { data: onDemandIndex } = await loadEc2Index(
+      context,
+      onDemandAgg.aggregation,
+      this.fetchOptions,
+    );
+    let instanceEntry;
+    let selectionChoice = "advancedView";
+    if (instanceProvided) {
+      instanceEntry = findEc2Instance(
+        onDemandIndex,
+        context.display,
+        String(instanceProvided),
+      );
+    } else {
+      selectionChoice = "quickView";
+      const candidates = Object.values(
+        onDemandIndex.regions?.[context.display] ?? {},
+      )
+        .filter((entry) => {
+          const vcpu = Number(entry.vCPU ?? 0);
+          const mem = Number(String(entry.Memory ?? "0").replace(/[^\d.]/g, ""));
+          const type = String(entry["Instance Type"] ?? "");
+          const family = type.split(".")[0];
+          // The recommendation excludes burstable, AMD, and Graviton
+          // families; it keeps current-generation Intel-compatible instances.
+          const excludedFamily =
+            /^t/i.test(family) ||
+            /a$/i.test(family) ||
+            /g/i.test(family) ||
+            /metal/i.test(type);
+          return (
+            vcpu >= cpu &&
+            mem >= memory &&
+            (entry["Current Generation"] ?? "Yes") === "Yes" &&
+            !excludedFamily
+          );
+        })
+        .sort((a, b) => Number(a.price) - Number(b.price));
+      if (candidates.length === 0) {
+        throw new AxiError(
+          `No EC2 instance in ${context.display} meets ${cpu} vCPU / ${memory} GiB`,
+          "VALIDATION_ERROR",
+          ["Pass --set instanceType=<type> to pick an instance explicitly"],
+        );
+      }
+      instanceEntry = candidates[0];
+    }
+    const instanceType = instanceEntry["Instance Type"];
+    const vcpus = instanceEntry.vCPU ?? String(cpu);
+    const onDemandRate = Number(instanceEntry.price) || 0;
+
+    let unitMonthly = onDemandRate * 730;
+    let unitUpfront = 0;
+    let subTotalMonthly = "totalOnDemandPrice";
+    if (strategy === "standard" || strategy === "convertible") {
+      const offering = strategy === "convertible" ? "convertible" : "standard";
+      const selected = selectEc2Aggregation(context, {
+        tenancy: "Shared",
+        os: ec2Os,
+        preInstalled,
+        termType: "Reserved",
+        lease: `${term}yr`,
+        purchase: purchaseOption,
+        offering,
+      });
+      const { data } = await loadEc2Index(
+        context,
+        selected.aggregation,
+        this.fetchOptions,
+      );
+      const price = findEc2Price(data, context.display, instanceType);
+      unitMonthly = price.hourly * 730;
+      unitUpfront = price.upfront;
+      subTotalMonthly =
+        strategy === "convertible"
+          ? "totalMonthlyConvertibleReservedPrice"
+          : "totalMonthlyStandardReservedPrice";
+    } else if (strategy === "compute-savings" || strategy === "instance-savings") {
+      const savingsIndex = await loadEc2SavingsIndex(
+        context,
+        {
+          kind: strategy,
+          term,
+          purchaseOption,
+          os: ec2Os,
+          preInstalled,
+          tenancy: "Shared",
+        },
+        this.fetchOptions,
+      );
+      const rate = extractEc2SavingsRate(savingsIndex, context.display, {
+        kind: strategy,
+        term,
+        purchaseOption,
+        instanceType,
+      });
+      if (rate == null) {
+        throw new AxiError(
+          `No ${strategy} Savings Plan rate found for ${instanceType} in ${context.display}`,
+          "VALIDATION_ERROR",
+        );
+      }
+      const upfront = this.savingsPlanUpfront(rate, term, purchaseOption);
+      const effective = effectiveHourlyRate(term, rate, upfront);
+      unitMonthly = effective * 730;
+      unitUpfront = upfront;
+      subTotalMonthly =
+        strategy === "instance-savings"
+          ? "totalMonthlyInstanceSavingsPrice"
+          : "totalMonthlyComputeSavingsPrice";
+    }
+
+    const totalMonthly = roundHalfUp(quantity * unitMonthly, 2);
+    const totalUpfront = roundHalfUp(quantity * unitUpfront, 2);
+    this.values.set(subTotalMonthly, totalMonthly);
+    this.values.set("totalInstanceUpfrontPrice", totalUpfront);
+
+    // Storage: one gp3 1000 GiB volume unless the caller supplies a volume.
+    const storageType = String(
+      take(["storageType", "volumeType"], "General Purpose (gp3)"),
+    );
+    const storageAmount = asNumber(
+      take(["storageAmount", "volumeSize"], 1000),
+    );
+    const storageIops = asNumber(take(["storageIops", "iops"], 0));
+    const storageThroughput = asNumber(
+      take(["storageThroughput", "throughput"], 0),
+    );
+    const ebs = this.maps.get("ebs");
+    const ebsPrice = (unit) => ebs?.priceFor(unit) ?? 0;
+    let storageUnit = 0;
+    if (/gp3/i.test(storageType)) {
+      storageUnit = storageAmount * ebsPrice("Storage General Purpose gp3 GB Mo");
+      storageUnit +=
+        Math.max(0, storageIops - 3000) *
+        ebsPrice("Provisioned EBS IOPS gp3 Volumes per IOPS Mo");
+      storageUnit +=
+        (Math.max(0, storageThroughput - 125) / 1024) *
+        ebsPrice("Provisioned Throughput gp3 per GiBps mo");
+    } else if (/gp2/i.test(storageType) || /^General Purpose$/i.test(storageType)) {
+      storageUnit = storageAmount * ebsPrice("Storage General Purpose gp2 GB Mo");
+    } else if (/io2/i.test(storageType)) {
+      storageUnit = storageAmount * ebsPrice("Storage Provisioned IOPS io2 GB month");
+      const tiers = [
+        [32000, "Provisioned EBS IOPS io2 Volumes per IOPS Mo"],
+        [32000, "Provisioned EBS IOPS Tier 2 io2 Volumes per IOPS Mo"],
+        [Infinity, "Provisioned EBS IOPS Tier 3 io2 Volumes per IOPS Mo"],
+      ];
+      let remaining = storageIops;
+      for (const [limit, unit] of tiers) {
+        const used = Math.min(remaining, limit);
+        storageUnit += used * ebsPrice(unit);
+        remaining -= used;
+        if (remaining <= 0) break;
+      }
+    } else if (/io1/i.test(storageType)) {
+      storageUnit =
+        storageAmount * ebsPrice("Storage Provisioned IOPS io1 GB Mo") +
+        storageIops * ebsPrice("Provisioned EBS IOPS io1 Volumes per IOPS Mo");
+    } else if (/st1|Throughput/i.test(storageType)) {
+      storageUnit = storageAmount * ebsPrice("Storage Throughput Optimized HDD st1 GB Mo");
+    } else if (/sc1|Cold HDD/i.test(storageType)) {
+      storageUnit = storageAmount * ebsPrice("Storage Cold HDD sc1 GB Mo");
+    }
+    const totalStorage = roundHalfUp(storageUnit * quantity, 2);
+    this.values.set("totalStorageCost", totalStorage);
+
+    const volumeId = "volume1";
+    const pricingValue = {
+      model: strategy,
+      term: `${term} Year`,
+      upfrontPayment:
+        purchaseOption === "No Upfront" ? "None" : purchaseOption,
+    };
+    const raw = {
+      sharedTenancy: { value: [machineId] },
+      windowsLicenseCheckboxes: {
+        checkedStates: { bringWindowsLicense: bringWindows },
+      },
+      bringWindowsLicense: { value: bringWindows },
+      sqlLicenseCheckboxes: {
+        checkedStates: {
+          bringSQLLicense: bringSQL,
+          haveSoftwareAssurance: haveSA,
+        },
+      },
+      bringSQLLicense: { value: bringSQL },
+      haveSoftwareAssurance: { value: haveSA },
+      workflow: { value: "shared" },
+      pricingStrategyDedicatedHosts: { value: pricingValue },
+      pricingStrategy: { value: pricingValue },
+      dhRecommendationWorkflow: {
+        value: {
+          uploadedFile: null,
+          recommendationResult: [],
+          hostToServersMapping: {},
+          hostToLicensesMapping: {},
+          machineSpecs: {},
+          recommendationInProgress: false,
+        },
+        initialState: null,
+        calculationString: null,
+        configSummaryString: null,
+        subType: "workflowInstruction",
+        isInError: false,
+        userState: null,
+        conversionStrings: null,
+        touched: null,
+      },
+      workloadInstanceMath: {
+        subType: "workloadInstanceMath",
+        value: {
+          [machineId]: {
+            instanceType,
+            quantity: String(quantity),
+            sqlServer: sqlId,
+            vcpus: String(vcpus),
+            windowsServer: osId,
+          },
+        },
+      },
+      workloadStorageMath: {
+        subType: "workloadStorageMath",
+        value: {
+          [machineId]: {
+            [storageType]: [
+              {
+                iops: storageIops,
+                throughput: storageThroughput,
+                volumeCount: 1,
+                volumeSize: storageAmount,
+              },
+            ],
+          },
+        },
+      },
+      [`machineSpecificationDescription_${machineId}`]: { value: description },
+      [`machineSpecificationStorage_${machineId}`]: {
+        value: {
+          [volumeId]: {
+            volumeType: { value: storageType },
+            provisionedIops: storageIops
+              ? { value: String(storageIops) }
+              : {},
+            volumeSize: { value: String(storageAmount) },
+            volumeThroughput: storageThroughput
+              ? { value: String(storageThroughput) }
+              : {},
+          },
+        },
+      },
+      [`machineSpecificationOperatingSystem_${machineId}`]: { value: osId },
+      [`machineSpecificationSQLServerVersion_${machineId}`]: { value: sqlId },
+      [`instanceSelectionChoice_${machineId}`]: { value: selectionChoice },
+      [`machineSpecificationQuantity_${machineId}`]: {
+        value: String(quantity),
+      },
+      [`cpuInput_${machineId}`]: { value: String(cpu) },
+      [`memoryInput_${machineId}`]: { value: String(memory) },
+      [`machineSpecificationSqlPassiveNode_${machineId}`]: {
+        value: String(passive),
+      },
+      [`optimizeCpus_${machineId}`]: { value: String(optimizeCpus) },
+    };
+    if (selectionChoice === "advancedView") {
+      raw[`instanceTypeSearch_${machineId}`] = { value: instanceType };
+    }
+    for (const [id, value] of Object.entries(raw)) {
+      this.rawInputs.set(id, value);
+    }
+    for (const component of components) {
+      if (component.id) this.handledComponents.add(component.id);
+    }
+    this.summary.push({
+      id: "windowsWorkload",
+      label: "Windows workload",
+      text: `Windows workload (${description}: ${instanceType} x ${quantity})`,
+    });
+    this.summary.push({
+      id: "windowsStorage",
+      label: "Storage",
+      text: `Storage (${storageType}, ${storageAmount} GB)`,
+    });
+  }
+
+  selectPlcAggregation(context, desired, requiredKeys = []) {
+    try {
+      return selectAggregation(context, desired);
+    } catch {
+      const aggregations = context.aggregation?.aggregations ?? [];
+      for (const key of requiredKeys.filter(Boolean)) {
+        const value = desired[key];
+        if (value == null || value === "") continue;
+        const hasValue = aggregations.some(
+          (entry) => String(entry.selectors?.[key]) === String(value),
+        );
+        if (!hasValue) {
+          throw new AxiError(
+            `No calculator price matches ${key}=${value} in ${context.display}`,
+            "VALIDATION_ERROR",
+            ["Run `awscalc service <code>` to inspect the available values"],
+          );
+        }
+      }
+      const scored = aggregations.map((entry) => {
+        let score = 0;
+        for (const [key, value] of Object.entries(desired)) {
+          if (value == null || value === "") continue;
+          if (String(entry.selectors?.[key]) === String(value)) {
+            score += key === "TermType" ? 4 : 2;
+          }
+        }
+        return { entry, score };
+      });
+      scored.sort((a, b) => b.score - a.score);
+      if (!scored[0] || scored[0].score === 0) {
+        throw new AxiError(
+          `No calculator price matches ${JSON.stringify(desired)} in ${context.display}`,
+          "VALIDATION_ERROR",
+          ["Run `awscalc service <code>` to inspect the selector values"],
+        );
+      }
+      return scored[0].entry;
+    }
   }
 
   /** Resolve a columnFormIPM instance table row via the PLC 2.0 price index. */
@@ -867,7 +1979,9 @@ export class Engine {
       pseudo["TermType"] ??
       termTypeRow?.defaultValue ??
       "OnDemand";
-    const reserved = /reserved/i.test(String(termType));
+    const additionalItem = this.findAdditionalPricingItem(component, termType);
+    const reserved =
+      /reserved/i.test(String(termType)) || Boolean(additionalItem);
     if (
       hasTermSelector &&
       !reserved &&
@@ -879,13 +1993,15 @@ export class Engine {
         "UNSUPPORTED_SERVICE",
         [
           "Use `--set pricingModel=OnDemand` or `pricingModel=Reserved`",
-          "Database Savings Plans / other commitment models are not implemented",
+          `Pricing model "${termType}" needs an additional pricing artifact`,
         ],
       );
     }
     const term = reserved
       ? normalizeTerm(
-          pseudo["LeaseContractLength"] ?? leaseRow?.defaultValue ?? "1yr",
+          pseudo["LeaseContractLength"] ??
+            leaseRow?.defaultValue ??
+            "1yr",
         )
       : "";
     const purchaseOption = reserved
@@ -896,6 +2012,7 @@ export class Engine {
 
     const instanceTable = Boolean(instanceRow) && Boolean(component.calculationId?.monthly);
     const instanceSelector = instanceRow?.selectorId;
+    const selectionTermType = additionalItem ? "OnDemand" : termType;
     let instanceType =
       instanceSelector ? pseudo[instanceSelector] : undefined;
     if (instanceTable && !instanceType) {
@@ -904,7 +2021,7 @@ export class Engine {
           (entry) =>
             (!deployment ||
               entry.selectors?.["Deployment Option"] === deployment) &&
-            (entry.selectors?.TermType ?? "OnDemand") === termType,
+            (entry.selectors?.TermType ?? "OnDemand") === selectionTermType,
         )
         .sort((a, b) => {
           const vcpu = Number(a.selectors?.vCPU ?? 0) - Number(b.selectors?.vCPU ?? 0);
@@ -919,7 +2036,7 @@ export class Engine {
     const desired = {
       [instanceSelector]: instanceType,
       "Deployment Option": deployment,
-      TermType: termType,
+      TermType: selectionTermType,
       "Cache Engine": pseudo["Cache Engine"],
       "Instance Family": pseudo["Instance Family"],
       "Database Engine": pseudo["Database Engine"],
@@ -933,25 +2050,134 @@ export class Engine {
     for (const key of Object.keys(desired)) {
       if (!selectorKeys.has(key)) delete desired[key];
     }
-    const aggregation = selectAggregation(context, desired);
+
+    for (const [selector, value] of Object.entries(pseudo)) {
+      if (value != null && value !== "" && selectorKeys.has(selector)) {
+        desired[selector] =
+          selector === "TermType" && additionalItem
+            ? selectionTermType
+            : String(value);
+      }
+    }
+
+    // Rows with a `dependent` parent are computed by the calculator when the
+    // parent changes; only use a default when the combination exists.
+    for (const row of rows) {
+      const selector = row.selectorId;
+      if (!selector || selector in desired || row.type === "utilization") continue;
+      if (row.dependent && !row.exportValueAs) continue;
+      const value = pseudo[selector] ?? row.defaultValue;
+      if (value != null && value !== "" && selectorKeys.has(selector)) {
+        desired[selector] = String(value);
+      }
+    }
+    const utilizationSelector = utilizationRow?.selectorId;
+    if (
+      utilizationRow &&
+      utilizationSelector &&
+      !pseudo[utilizationSelector]
+    ) {
+      const raw =
+        pseudo.utilization != null
+          ? { unit: pseudo.utilization, selectedId: "%Utilized/Month" }
+          : utilizationRow.defaultValue;
+      const selectedId =
+        raw && typeof raw === "object" ? raw.selectedId : undefined;
+      if (selectedId && selectorKeys.has(utilizationSelector)) {
+        const reverse = Object.entries(component.remap?.keyValue ?? {}).find(
+          ([, display]) =>
+            normalizeToken(display) === normalizeToken(selectedId),
+        );
+        desired[utilizationSelector] = reverse ? reverse[0] : selectedId;
+      }
+    }
+    const remap = component.remap?.keyValue ?? {};
+    const toAggregationValue = (selector, value) => {
+      const reverse = Object.entries(remap).find(
+        ([, display]) => normalizeToken(display) === normalizeToken(value),
+      );
+      return reverse ? reverse[0] : String(value);
+    };
+    for (const [key, value] of Object.entries(desired)) {
+      desired[key] = toAggregationValue(key, value);
+    }
+    for (const row of rows) {
+      if (!row.dependent || row.exportValueAs || !row.selectorId) continue;
+      if (desired[row.selectorId] != null) continue;
+      if (row.defaultValue == null || row.defaultValue === "") continue;
+      const candidate = toAggregationValue(row.selectorId, row.defaultValue);
+      const test = { ...desired, [row.selectorId]: candidate };
+      const matches = aggregations.some((entry) =>
+        Object.entries(test).every(
+          ([key, value]) =>
+            value == null || value === "" ||
+            String(entry.selectors?.[key]) === String(value),
+        ),
+      );
+      if (matches) desired[row.selectorId] = candidate;
+    }
+    const aggregation = this.selectPlcAggregation(context, desired, [
+      instanceSelector,
+      "Deployment Option",
+      "TermType",
+    ]);
     const selected = aggregation.selectors ?? {};
+    if (instanceSelector && !instanceType) {
+      instanceType = selected[instanceSelector];
+    }
     const { data } = await loadPlcIndex(
       context,
       selected,
       this.fetchOptions,
     );
-    const prices = extractPrices(
-      data,
-      context.display,
-      {
-        termType,
+    const prices = additionalItem
+      ? { hourly: 0, monthly: 0, upfront: 0, perUnit: 0, entries: [] }
+      : extractPrices(
+          data,
+          context.display,
+          {
+            termType,
+            term,
+            purchaseOption,
+            pricingUnitModel: component.pricingUnitModel,
+            calculationId: component.calculationId,
+          },
+          rows,
+        );
+    if (additionalItem) {
+      const additional = await this.loadAdditionalPricing(additionalItem, {
+        instanceType,
         term,
         purchaseOption,
-        pricingUnitModel: component.pricingUnitModel,
-        calculationId: component.calculationId,
-      },
-      rows,
-    );
+        deployment: selected["Deployment Option"] ?? deployment,
+        databaseEngine:
+          selected["Database Engine"] ?? pseudo["Database Engine"],
+        termYears: term === "3yr" ? 3 : 1,
+      });
+      if (!additional) {
+        throw new AxiError(
+          `No ${additionalItem.name} price found for ${instanceType} in ${context.display}`,
+          "VALIDATION_ERROR",
+          [
+            "This instance/storage combination may not be eligible for that pricing model",
+            "Try another instance type or pricing model",
+          ],
+        );
+      }
+      const years = term === "3yr" ? 3 : 1;
+      const fraction =
+        purchaseOption === "All Upfront"
+          ? 1
+          : purchaseOption === "Partial Upfront"
+            ? 0.5
+            : 0;
+      const upfront = fraction * additional.rate * commitmentHours(years);
+      const effective = effectiveHourlyRate(years, additional.rate, upfront);
+      prices.rate = additional.rate;
+      prices.hourly = effective;
+      prices.monthly = effective * 730;
+      prices.upfront = upfront;
+    }
 
     const nodes = asNumber(
       pseudo["Number of Nodes"] ??
@@ -983,13 +2209,46 @@ export class Engine {
       }
     }
     const utilization = (utilizationHours / 730) * 100;
-    const monthly =
-      instanceTable && component.calculationId?.monthly
-        ? roundHalfUp(
-            nodes * prices.hourly * (reserved ? 730 : utilizationHours),
-            2,
-          )
-        : null;
+    const runningMode = String(
+      selected["Running Mode"] ?? pseudo["Running Mode"] ?? "",
+    );
+    const billingMode = String(
+      selected.BillingOption ??
+        selected["Billing Option"] ??
+        pseudo.BillingOption ??
+        "",
+    );
+    const utilizationMode = String(utilizationUnit ?? "");
+    const monthlyPricing = component.pricingUnitModel?.riPricingTypes?.monthly;
+    const hourlyPricing = component.pricingUnitModel?.riPricingTypes?.hourly;
+    const usesMonthly =
+      Boolean(monthlyPricing) &&
+      !/hourly|autostop/i.test(runningMode) &&
+      !/hourly/i.test(billingMode) &&
+      !/hourly/i.test(utilizationMode);
+    const usesHourly =
+      Boolean(hourlyPricing) &&
+      (/hourly|autostop/i.test(runningMode) ||
+        /hourly/i.test(billingMode) ||
+        /hourly/i.test(utilizationMode));
+    // The PLC engine rounds monthly instance costs up to the next cent.
+    const plcMonthly = (value) => Number(roundUpTo(value, 0.01).toFixed(2));
+    let monthly = null;
+    if (component.calculationId?.monthly) {
+      if (usesMonthly) {
+        monthly = plcMonthly(nodes * (prices.monthly || prices.perUnit));
+      } else if (usesHourly) {
+        const base = prices.monthly || 0;
+        const rate = prices.hourly || 0;
+        monthly = plcMonthly(nodes * (base + rate * utilizationHours));
+      } else if (instanceTable) {
+        monthly = plcMonthly(
+          nodes * prices.hourly * (reserved ? 730 : utilizationHours),
+        );
+      } else if (prices.monthly || prices.perUnit) {
+        monthly = plcMonthly(nodes * (prices.monthly || prices.perUnit));
+      }
+    }
     const upfront = roundHalfUp(
       (instanceTable ? nodes : 1) * prices.upfront,
       2,
@@ -1052,10 +2311,17 @@ export class Engine {
       };
     }
     if (utilizationRow) {
-      rowState.undefined = {
+      const key = utilizationRow.selectorId ?? "undefined";
+      let selectedId = utilizationUnit;
+      if (utilizationRow.selectorId === "Running Mode") {
+        const mode = selected["Running Mode"] ?? pseudo["Running Mode"];
+        selectedId =
+          component.remap?.keyValue?.[mode] ?? utilizationUnit;
+      }
+      rowState[key] = {
         value: {
           unit: utilizationValue,
-          selectedId: utilizationUnit,
+          selectedId,
         },
       };
     }
@@ -1066,8 +2332,12 @@ export class Engine {
     }
     for (const row of rows) {
       if (!row.selectorId || row.selectorId === "Number of Nodes") continue;
+      if (row.type === "utilization") continue;
       if (row.selectorId === "Instance Type" && !instanceTable) continue;
-      let value = selected[row.selectorId] ?? pseudo[row.selectorId];
+      let value =
+        row.selectorId === "TermType" && additionalItem
+          ? termType
+          : selected[row.selectorId] ?? pseudo[row.selectorId];
       if (
         (value == null || value === "") &&
         (row.type === "textInput" || row.type === "numericInput") &&
@@ -1076,7 +2346,9 @@ export class Engine {
         value = this.values.get(row.exportValueAs);
       }
       if (value != null && value !== "") {
-        rowState[row.selectorId] = { value: String(value) };
+        rowState[row.selectorId] = {
+          value: String(remap[value] ?? value),
+        };
       }
     }
     if (reserved && leaseRow) {
@@ -1107,9 +2379,11 @@ export class Engine {
       );
     }
     if (termTypeRow) {
-      const label = termTypeRow.mappingValue
-        ? termTypeRow.mappingValue[selected.TermType] ?? selected.TermType
-        : selected.TermType ?? termType;
+      const label = additionalItem
+        ? termType
+        : termTypeRow.mappingValue
+          ? termTypeRow.mappingValue[selected.TermType] ?? selected.TermType
+          : selected.TermType ?? termType;
       summary.push(`${termTypeRow.label} (${label})`);
     }
     if (reserved && leaseRow) summary.push(`${leaseRow.label} (${term})`);
@@ -1305,12 +2579,11 @@ export class Engine {
   resolveInput(component, provided) {
     const subType = component.subType;
     if (NON_VALUE_INPUT.has(subType)) return;
+    if (subType === "dataTransferV2") {
+      this.resolveDataTransfer(component, provided);
+      return;
+    }
     if (!SUPPORTED_INPUT.has(subType)) {
-      if (subType === "dataTransferV2" && !provided) {
-        this.warning(`Skipped optional data transfer input ${component.id}`);
-        this.values.set(component.id, 0);
-        return;
-      }
       throw new AxiError(
         `Input "${component.label ?? component.id}" (${component.id}) uses unsupported control type "${subType}"`,
         "UNSUPPORTED_SERVICE",
@@ -1350,6 +2623,110 @@ export class Engine {
       });
     }
     return resolved;
+  }
+
+  resolveDataTransfer(component, provided) {
+    const map = this.maps.get(component.mappingDefinitionName);
+    const raw = provided?.value ?? provided?.text ?? "";
+    const entries = parseDataTransferEntries(raw, this.displayRegion);
+    if (entries.length === 0) {
+      this.values.set(component.id, 0);
+      return;
+    }
+    if (!map) {
+      throw new AxiError(
+        `Data transfer pricing is unavailable for ${component.id}`,
+        "UNSUPPORTED_SERVICE",
+        ["The calculator has no data transfer map for this service in this region"],
+      );
+    }
+    const clean = (value) =>
+      String(value)
+        .replace(/[().,]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    const tierPrices = Object.entries(map.data)
+      .filter(([key, entry]) => {
+        const start = Number(entry?.StartingRange);
+        const end = entry?.EndingRange;
+        return (
+          key.startsWith("DataTransfer External Outbound") &&
+          Number.isFinite(start) &&
+          (end != null)
+        );
+      })
+      .map(([key, entry]) => ({
+        key,
+        start: Number(entry.StartingRange),
+        end: /inf/i.test(String(entry.EndingRange))
+          ? Infinity
+          : Number(entry.EndingRange),
+        price: Number(entry.price) || 0,
+      }))
+      .sort((a, b) => a.start - b.start);
+
+    let total = 0;
+    const state = [];
+    for (const entry of entries) {
+      let cost = 0;
+      if (entry.entryType === "INBOUND") {
+        cost = 0;
+      } else if (entry.entryType === "INTRA_REGION") {
+        const price = map.priceFor("DataTransfer IntraRegion") ?? 0;
+        // The calculator charges both directions for intra-region traffic.
+        cost = price * entry.gb * 2;
+      } else if (entry.toRegion && !/^(external|other)$/i.test(entry.toRegion)) {
+        const display = regionName(entry.toRegion) ?? entry.toRegion;
+        const key = `DataTransfer InterRegion Outbound to ${clean(display)}`;
+        const price = map.priceFor(key);
+        if (price == null) {
+          this.warning(
+            `No inter-region outbound price for ${display} in ${this.displayRegion}`,
+          );
+          cost = 0;
+        } else {
+          cost = price * entry.gb;
+        }
+      } else if (tierPrices.length > 0) {
+        for (const tier of tierPrices) {
+          const end = Number.isFinite(tier.end) ? tier.end : entry.gb;
+          const used = Math.max(Math.min(entry.gb, end) - tier.start, 0);
+          if (used > 0) cost += used * tier.price;
+        }
+      } else {
+        cost = (map.priceFor("DataTransfer External Outbound") ?? 0) * entry.gb;
+      }
+      total += cost;
+      state.push({
+        entryType: entry.entryType,
+        value: entry.gb,
+        unit: "gb_month",
+        ...(entry.fromRegion ? { fromRegion: entry.fromRegion } : {}),
+        ...(entry.toRegion ? { toRegion: entry.toRegion } : {}),
+        ...(entry.optionType ? { optionType: entry.optionType } : {}),
+      });
+    }
+    const amount = roundHalfUp(total, 2);
+    this.values.set(component.id, amount);
+    this.rawInputs.set(component.id, { value: state });
+    if (component.displayInConfigSummary !== false) {
+      const labels = {
+        INBOUND: "Inbound",
+        INTRA_REGION: "Intra-Region",
+        OUTBOUND: "Outbound",
+      };
+      const parts = entries.map((entry) => {
+        const region = entry.toRegion ?? entry.fromRegion;
+        return `${labels[entry.entryType] ?? entry.entryType}: ${formatNumber(
+          entry.value,
+        )} TB per month${region ? ` (${region})` : ""}`;
+      });
+      this.summary.push({
+        id: component.id,
+        label: component.label ?? "Data Transfer",
+        text: `Data Transfer (${parts.join(", ")})`,
+      });
+    }
   }
 
   resolveFileSizeFrequency(component, unitText) {
@@ -1912,6 +3289,13 @@ export class Engine {
 
   evaluateMath(component) {
     if (component.subType === "ec2AdvPricingStrategyMath") {
+      return this.values.get(component.id) ?? {};
+    }
+    if (
+      component.subType === "workloadInstanceMath" ||
+      component.subType === "workloadStorageMath" ||
+      component.subType === "dedicatedHostsMath"
+    ) {
       return this.values.get(component.id) ?? {};
     }
     if (!SUPPORTED_MATH.has(component.subType)) {

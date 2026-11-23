@@ -3,7 +3,12 @@ import test from "node:test";
 
 import { AxiError } from "axi-sdk-js";
 
-import { Engine, selectTemplate, supportedSurface } from "../src/engine.js";
+import {
+  Engine,
+  parseDataTransferEntries,
+  selectTemplate,
+  supportedSurface,
+} from "../src/engine.js";
 import { regionName } from "../src/regions.js";
 
 function mapWith(units) {
@@ -335,4 +340,84 @@ test("reports unsupported maths and input types instead of silently returning 0"
   );
   const surface = supportedSurface(def);
   assert.deepEqual(surface.unsupportedInput, ["priceSelector"]);
+});
+
+
+test("parses data transfer specs into calculator entries", () => {
+  const entries = parseDataTransferEntries(
+    "OUTBOUND:1TB; INTRA_REGION:100GB; INBOUND:2TB; OUTBOUND:500GB@us-west-2",
+    "US East (Ohio)",
+  );
+  assert.equal(entries.length, 4);
+  assert.deepEqual(entries[0], {
+    entryType: "OUTBOUND",
+    value: 1,
+    unit: "tb_month",
+    gb: 1024,
+    fromRegion: null,
+    toRegion: "External",
+    optionType: null,
+  });
+  assert.equal(entries[1].entryType, "INTRA_REGION");
+  assert.equal(entries[1].gb, 100);
+  assert.equal(entries[2].fromRegion, "External");
+  assert.equal(entries[3].toRegion, "us-west-2");
+});
+
+test("prices external outbound data transfer with progressive tiers", () => {
+  const engine = new Engine({
+    definition: { serviceCode: "test", serviceName: "Test" },
+    template: { id: "t", cards: [] },
+    region: "us-east-1",
+    displayRegion: "US East (N. Virginia)",
+    maps: new Map(),
+    currency: "USD",
+  });
+  engine.maps.set(
+    "datatransfer-calc",
+    mapWith({
+      "DataTransfer External Outbound Next 10 TB": 0.09,
+      "DataTransfer External Outbound Next 40 TB": 0.085,
+    }).get("test"),
+  );
+  const raw = {
+    "DataTransfer External Outbound Next 10 TB": {
+      price: "0.09",
+      StartingRange: "0",
+      EndingRange: "10240",
+    },
+    "DataTransfer External Outbound Next 40 TB": {
+      price: "0.085",
+      StartingRange: "10240",
+      EndingRange: "51200",
+    },
+  };
+  const map = engine.maps.get("datatransfer-calc");
+  map.data = raw;
+  map.priceFor = (unit) => (raw[unit] ? Number(raw[unit].price) : null);
+  engine.resolveDataTransfer(
+    { id: "dataTransferForEC2", mappingDefinitionName: "datatransfer-calc" },
+    { value: "OUTBOUND:11TB" },
+  );
+  assert.ok(Math.abs(engine.values.get("dataTransferForEC2") - 1008.64) < 0.001);
+});
+
+test("prices intra-region transfer in both directions", () => {
+  const engine = new Engine({
+    definition: { serviceCode: "test", serviceName: "Test" },
+    template: { id: "t", cards: [] },
+    region: "us-east-1",
+    displayRegion: "US East (N. Virginia)",
+    maps: new Map(),
+    currency: "USD",
+  });
+  engine.maps.set(
+    "datatransfer-calc",
+    mapWith({ "DataTransfer IntraRegion": 0.01 }).get("test"),
+  );
+  engine.resolveDataTransfer(
+    { id: "dataTransferForEC2", mappingDefinitionName: "datatransfer-calc" },
+    { value: "INTRA_REGION:100GB" },
+  );
+  assert.equal(engine.values.get("dataTransferForEC2"), 2);
 });

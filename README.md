@@ -131,23 +131,34 @@ Validated by publishing an estimate and comparing the stored total with the calc
 | EC2 | t4g.nano Linux Compute Savings 3yr | `$1.53/mo` |
 | EC2 | m5.large ×2 Linux On-Demand | `$140.16/mo` |
 | EC2 | m5.large Windows On-Demand | `$137.24/mo` |
+| EC2 | m5.large Standard RI 1yr No Upfront | `$43.80/mo` |
+| EC2 | Dedicated Instance m5.large On-Demand | `$1,534.46/mo` (incl. `$1,460` region fee) |
+| EC2 | Dedicated Host c5 On-Demand | `$2,457.18/mo` |
+| EC2 | Monthly spike, cost-optimized 3yr | `$109.01/mo` |
+| EC2 | m5.large + 1 TB external outbound | `$162.24/mo` |
+| WorkSpaces Personal | Standard, Windows, license included | `$33/mo` |
+| Windows Workloads | m7i-flex.xlarge, SQL BYOL | `$300.08/mo` |
+| RDS MySQL | Database Savings Plan, db.m7g.large | `$149.77/mo` |
 
 ## Coverage
 
 The calculator publishes 441 service definitions. `awscalc` can price:
 
-- **162 of 163 top-level single services**
-- **33 of 33 grouped services**, with **205 of 208 sub-services**
+- **163 of 163 top-level single services** (Windows workloads: shared tenancy)
+- **33 of 33 grouped services**, with **207 of 208 sub-services**
 - PLC 2.0 instance tables (RDS family, Aurora, ElastiCache, OpenSearch, MSK, Neptune, DocumentDB, Redshift, Keyspaces, MemoryDB, …) including **Reserved Instances** (No/Partial/All Upfront)
-- **EC2 shared tenancy** with On-Demand, Compute Savings Plans, Instance Savings Plans, and Spot, plus EBS and detailed monitoring
+- **EC2** shared/dedicated/host tenancy; On-Demand, Compute/Instance Savings Plans, Standard/Convertible Reserved Instances, Spot, and cost-optimized mixed strategies; constant and daily/weekly/monthly spike workloads; EBS, monitoring, and data transfer
+- **Dedicated Host** pricing through EC2 `tenancy=host` (host family on-demand, Reserved, and Savings Plans)
+- **Windows Server and SQL Server on EC2** shared-tenancy workflows
+- **WorkSpaces Personal, Core Bundles, and Core Managed Instances** monthly/hourly bundle tables
+- **Database Savings Plans** for RDS via the calculator's `additionalPricingData` artifact
+- **`dataTransferV2`** inbound, intra-region, external outbound, and inter-region matrices
 
 Still missing:
 
-- **EC2 dedicated/host tenancy, Reserved Instances, and daily/weekly/monthly spike workloads**
-- **Windows workloads** on EC2 (dedicated host and SQL Server license tables)
-- **WorkSpaces Personal / Thin Client / Secure Browser** monthly pricing shape
-- Multi-row `columnFormIPM` tables and Database Savings Plans
-- `dataTransferV2` matrices (skipped with a warning)
+- Windows Server/SQL Server **dedicated-host workflow** inside the `windowsWorkloads` service (use EC2 host tenancy instead)
+- WorkSpaces **Pools** usage-pattern optimizer and WorkSpaces Thin Client/Secure Browser (the calculator does not publish those definitions)
+- Multi-row `columnFormIPM` tables (one row per table)
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the full status and roadmap.
 
@@ -182,7 +193,42 @@ awscalc price --service ec2 --region us-east-2 \
   --set detailedMonitoringCheckbox=true
 ```
 
-Selectors: `instanceType`, `instances`, `pricingStrategy` (`on-demand`, `compute-savings`, `instance-savings`), `term` (`1yr`/`3yr`), `upfront` (`None`), `workloadSelection` (`consistent`). Unsupported EC2 modes (dedicated/host, Reserved Instances, Spot, spike workloads) fail with `UNSUPPORTED_SERVICE` rather than mispricing.
+Selectors: `tenancy` (`shared`/`dedicated`/`host`), `instanceType`, `instances`, `pricingStrategy` (`on-demand`, `compute-savings`, `instance-savings`, `cost-optimized`, `standard`, `convertible`, `spot`), `term` (`1yr`/`3yr`), `upfront` (`None`, `Partial Upfront`, `All Upfront`), `workloadSelection` (`consistent`/`daily`/`weekly`/`monthly`), and `dataTransferForEC2`.
+
+```sh
+# Reserved Instances (1 year, All Upfront)
+awscalc price --service ec2 --region us-east-2 \
+  --set pricingStrategy=standard --set term=1yr --set upfront="All Upfront" \
+  --set instanceType=m5.large
+
+# Dedicated Instance (adds the calculator's per-region fee)
+awscalc price --service ec2 --region us-east-2 \
+  --set tenancy=dedicated --set instanceType=m5.large --set pricingStrategy=on-demand
+
+# Dedicated Host family (on-demand, Reserved, or Savings Plans)
+awscalc price --service ec2 --region us-east-2 \
+  --set tenancy=host --set instanceType=c5 --set pricingStrategy=standard \
+  --set term=3yr --set upfront=None
+
+# Monthly spike workload, cost-optimized mix of Reserved + On-Demand
+awscalc price --service ec2 --region us-east-2 \
+  --set pricingStrategy=cost-optimized --set instanceType=m5.large \
+  --set workloadSelection=monthly --set baseline=2 --set peak=6 \
+  --set spikeDays=5 --set spikeHours=8
+
+# Daily spike across weekdays (Mon..Fri)
+awscalc price --service ec2 --region us-east-2 \
+  --set workloadSelection=daily --set workloadDays=Mon,Tue,Wed,Thu,Fri \
+  --set baseline=1 --set peak=3 --set spikeHours=4
+
+# Data transfer matrix: OUTBOUND, INTRA_REGION, INBOUND; add @region for inter-region
+awscalc price --service ec2 --region us-east-2 --set instanceType=m5.large \
+  --set dataTransferForEC2="OUTBOUND:1TB; INTRA_REGION:100GB; OUTBOUND:500GB@us-west-2"
+```
+
+Spike workloads use the calculator's breakeven optimizer: baseline instances are committed and peak hours are split between the commitment and On-Demand at the calculator's breakeven point. The `--set` form above is a convenience; a full calculator workload object can also be passed as JSON to `workload` or through `--input-json`.
+
+When EC2 publishes the estimate, the exact workload object and data transfer entries are stored, so **Update estimate** recomputes the same optimizer.
 
 ## PLC 2.0 services (RDS, Aurora, ElastiCache, MSK, …)
 
@@ -220,6 +266,35 @@ awscalc price --service msk --region us-east-1 \
 ```
 
 Aliases: `instanceType`, `computeFamily`, `nodes`, `deployment`, `pricingModel`, `term`, `purchaseOption`, `utilization`, `engine`, `instanceFamily`. For services with multiple instance tables, append the table index (`instanceType2`, `deployment2`, …). `awscalc service <code>` lists the exact aliases and available selector values for the selected region.
+
+## WorkSpaces, Windows workloads, and Database Savings Plans
+
+```sh
+# WorkSpaces Personal (monthly AlwaysOn default)
+awscalc price --service amazonWorkspaces --region us-east-1 --set workspaces=2
+
+# Hourly / AutoStop billing (base monthly + hourly usage)
+awscalc price --service amazonWorkspaces --region us-east-1 \
+  --set license=Included --set runningMode=AutoStop --set workspaces=2 \
+  --set utilization=100
+
+# WorkSpaces Core bundle and Core Managed Instances
+awscalc price --service workSpacesCore --region us-east-1
+awscalc price --service workSpacesInstances --region us-east-1
+
+# Windows Server + SQL Server on EC2 (shared tenancy)
+awscalc price --service windowsWorkloads --region us-east-2 \
+  --set instanceType=m7i-flex.xlarge \
+  --set operatingSystem=windows-li --set sqlServerVersion=std-byol \
+  --set quantity=1 --set storageType="General Purpose (gp3)" --set storageAmount=1000GB
+
+# Database Savings Plans for RDS MySQL
+awscalc price --service rds-mysql --region us-east-1 \
+  --set pricingModel="Database Savings Plans" --set term=1yr \
+  --set deployment=Single-AZ --set instanceType=db.m7g.large
+```
+
+Windows workloads support the shared-tenancy workflow (Windows license-included/BYOL and SQL Server Standard/Web/Enterprise BYOL or license-included), Reserved Instances, Savings Plans, On-Demand, and one machine specification with EBS volumes. The dedicated-host workflow inside `windowsWorkloads` is not implemented; price Dedicated Hosts with `--service ec2 --set tenancy=host`.
 
 ## Regions
 

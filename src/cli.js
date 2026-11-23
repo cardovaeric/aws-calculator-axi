@@ -12,7 +12,12 @@ import {
   loadRegionList,
   serviceRegions,
 } from "./catalog.js";
-import { Engine, selectTemplate, supportedSurface } from "./engine.js";
+import {
+  COLUMN_ROW_ALIASES,
+  Engine,
+  selectTemplate,
+  supportedSurface,
+} from "./engine.js";
 import {
   buildGroupServiceEntry,
   buildPayload,
@@ -273,7 +278,10 @@ async function readInputJson(path) {
   return Object.fromEntries(
     Object.entries(parsed).map(([key, value]) => [
       key,
-      { text: String(value) },
+      {
+        text: typeof value === "string" ? value : JSON.stringify(value),
+        value,
+      },
     ]),
   );
 }
@@ -563,7 +571,8 @@ async function ec2Rows(definition, template, region, options) {
       id: "pricingStrategy",
       type: "ec2Strategy",
       default: "compute-savings",
-      values: "on-demand|compute-savings|instance-savings",
+      values:
+        "on-demand|compute-savings|instance-savings|cost-optimized|standard|convertible|spot",
     },
     {
       id: "term",
@@ -575,13 +584,25 @@ async function ec2Rows(definition, template, region, options) {
       id: "upfront",
       type: "ec2Strategy",
       default: "None",
-      values: "None",
+      values: "None|Partial Upfront|All Upfront",
     },
     {
       id: "workloadSelection",
       type: "ec2Workload",
       default: "consistent",
-      values: "consistent",
+      values: "consistent|daily|weekly|monthly",
+    },
+    {
+      id: "baseline|peak|spikeDays|spikeHours|spikeMinutes",
+      type: "ec2Workload",
+      default: "-",
+      values: "-",
+    },
+    {
+      id: "dataTransferForEC2",
+      type: "ec2DataTransfer",
+      default: "-",
+      values: "OUTBOUND:1TB; INTRA_REGION:100GB",
     },
   ];
   try {
@@ -776,7 +797,7 @@ async function serviceCommand(args) {
   }
   if (hasEc2) {
     help.push(
-      "EC2 supports constant workloads with On-Demand or Savings Plans; Reserved/Spot and spike workloads fail loudly",
+      "EC2 supports shared, dedicated, and host tenancy; On-Demand, Savings Plans, Reserved, Spot, and cost-optimized strategies; constant and daily/weekly/monthly spike workloads",
     );
   }
   if (columnFormCount > 1) {
@@ -1089,6 +1110,19 @@ async function priceGroup({
     }
     const template = templates[0];
     const ids = inputIdsForTemplate(template);
+    let columnIndex = 0;
+    for (const card of template.cards ?? []) {
+      for (const component of card.inputSection?.components ?? []) {
+        if (component.type !== "input" || component.subType !== "columnFormIPM") {
+          continue;
+        }
+        columnIndex += 1;
+        const suffix = columnIndex === 1 ? "" : String(columnIndex);
+        for (const alias of Object.keys(COLUMN_ROW_ALIASES)) {
+          ids.add(`${alias}${suffix}`);
+        }
+      }
+    }
     for (const id of ids) knownIds.add(id);
     const scoped = {};
     for (const [key, value] of Object.entries(overrides)) {
