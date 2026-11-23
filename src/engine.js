@@ -1006,8 +1006,12 @@ export class Engine {
 
     if (subType === "singlePricePoint") {
       const unit = this.selectMeteredUnit(component);
-      let price = map.priceFor(unit);
+      const zeroCost = typeof unit === "string" && /^\[.*COST\]$/.test(unit);
+      let price = zeroCost ? 0 : map.priceFor(unit);
       if (price == null) {
+        this.warning(
+          `${component.label ?? component.id}: no price for "${unit}" in ${this.displayRegion}`,
+        );
         if (component.backwardCompatibility?.hideCardWhenMissing !== false) {
           this.pricingValues.set(component.id, {
             kind: subType,
@@ -1027,8 +1031,9 @@ export class Engine {
       const refers = component.refers ?? [];
       const unit = this.resolvePricingReference(refers[0]);
       const key = refers[0]?.key;
-      const entry = map.entryFor(unit);
-      let price = null;
+      const zeroCost = typeof unit === "string" && /^\[.*COST\]$/.test(unit);
+      const entry = zeroCost ? 0 : map.entryFor(unit);
+      let price = zeroCost ? 0 : null;
       if (entry != null) {
         if (key) {
           const nested = entry[key];
@@ -1047,6 +1052,9 @@ export class Engine {
         this.pricingValues.set(component.id, { kind: subType, unit, price });
         this.values.set(component.id, price);
       } else {
+        this.warning(
+          `${component.label ?? component.id}: no price for "${unit}" in ${this.displayRegion}`,
+        );
         this.pricingValues.set(component.id, {
           kind: subType,
           unit,
@@ -1062,15 +1070,21 @@ export class Engine {
         component.tiers?.[this.displayRegion] ??
         component.tiers?.allRegions ??
         [];
-      const tiers = tiersRaw
-        .map((tier) => ({
-          start: Number(tier.startOfTier) || 0,
-          end: tier.endOfTier === -1 ? Infinity : Number(tier.endOfTier),
-          unit: tier.meteredUnit,
-          price: map.priceFor(tier.meteredUnit),
-        }))
+      const allTiers = tiersRaw.map((tier) => ({
+        start: Number(tier.startOfTier) || 0,
+        end: tier.endOfTier === -1 ? Infinity : Number(tier.endOfTier),
+        unit: tier.meteredUnit,
+        price: map.priceFor(tier.meteredUnit),
+      }));
+      const tiers = allTiers
         .filter((tier) => tier.price != null)
         .sort((a, b) => a.start - b.start);
+      const missingTiers = allTiers.length - tiers.length;
+      if (missingTiers > 0) {
+        this.warning(
+          `${component.label ?? component.id}: ${missingTiers} of ${allTiers.length} tier prices are unavailable in ${this.displayRegion}`,
+        );
+      }
       this.pricingValues.set(component.id, { kind: subType, tiers });
       return;
     }

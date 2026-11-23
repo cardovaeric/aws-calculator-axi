@@ -17,6 +17,8 @@ const MANIFEST_URL =
 const DEFINITION_URL = "https://example.test/testService/en_US.json";
 const PRICE_URL =
   "https://calculator.aws/pricing/2.0/meteredUnitMaps/test/USD/current/test.json";
+const REGION_LIST_URL =
+  "https://example.test/testService/regionList/publish.json";
 
 const definition = {
   version: "1.0.0",
@@ -122,6 +124,12 @@ async function cacheFixture() {
       },
     },
   });
+  await write(REGION_LIST_URL, {
+    inclusionList: ["us-east-1"],
+    exclusionList: [],
+    overwriteInclusionList: [],
+    overwriteExclusionList: [],
+  });
   return dir;
 }
 
@@ -169,6 +177,39 @@ test("lists catalog entries from cached data", async () => {
   assert.equal(code, 0, stdout);
   assert.match(stdout, /testService/);
   assert.match(stdout, /count: 1 of 1 services/);
+});
+
+test("rejects regions where the calculator does not offer the service", async () => {
+  const dir = await cacheFixture();
+  const env = { AWSCALC_CACHE_DIR: dir, AWSCALC_HISTORY_PATH: join(dir, "h.json") };
+  const { stdout, code } = await runCli(
+    [
+      "price",
+      "--service",
+      "testService",
+      "--region",
+      "eu-west-1",
+      "--set",
+      "storage=100GB",
+      "--offline",
+    ],
+    env,
+  );
+  assert.equal(code, 2, stdout);
+  assert.match(stdout, /not offered in eu-west-1/);
+  assert.match(stdout, /Available: us-east-1/);
+});
+
+test("lists the calculator's per-service region list", async () => {
+  const dir = await cacheFixture();
+  const env = { AWSCALC_CACHE_DIR: dir, AWSCALC_HISTORY_PATH: join(dir, "h.json") };
+  const { stdout, code } = await runCli(
+    ["regions", "--service", "testService", "--offline"],
+    env,
+  );
+  assert.equal(code, 0, stdout);
+  assert.match(stdout, /count: 1/);
+  assert.match(stdout, /us-east-1,US East \(N\. Virginia\)/);
 });
 
 test("rejects unknown flags with exit code 2 and the valid flag list", async () => {

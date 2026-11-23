@@ -5,9 +5,11 @@ import { AxiError, exitCodeForError, runAxiCli } from "axi-sdk-js";
 
 import {
   ALIASES,
+  effectiveRegions,
   findService,
   loadDefinition,
   loadManifest,
+  loadRegionList,
   serviceRegions,
 } from "./catalog.js";
 import { Engine, selectTemplate, supportedSurface } from "./engine.js";
@@ -615,7 +617,8 @@ async function regionsCommand(args) {
   }
   const options = { refresh: flags.refresh, offline: flags.offline };
   const { service, definition } = await resolveServiceAndDefinition(flags, options);
-  const regions = serviceRegions(service, definition);
+  const regionList = await loadRegionList(service, options);
+  const regions = serviceRegions(service, definition, regionList);
   const output = {
     service: service.code,
     count: regions.length,
@@ -677,6 +680,24 @@ async function priceCommand(args) {
   });
 }
 
+async function assertRegionAvailable(service, definition, region, options, { explicit = true } = {}) {
+  const regionList = await loadRegionList(service, options);
+  const available = effectiveRegions(service, definition, regionList);
+  if (available.length === 0 || available.includes(region)) return null;
+  const detail = [
+    `Available: ${available.slice(0, 10).join(", ")}${available.length > 10 ? `, +${available.length - 10} more` : ""}`,
+    `Run \`awscalc regions --service ${service.serviceCode ?? service.code}\` for the full list`,
+  ];
+  if (explicit) {
+    throw new AxiError(
+      `${service.name} is not offered in ${region} by the calculator`,
+      "VALIDATION_ERROR",
+      detail,
+    );
+  }
+  return { service, region, available, detail };
+}
+
 async function priceSingle({
   service,
   definition,
@@ -686,6 +707,7 @@ async function priceSingle({
   overrides,
   options,
 }) {
+  await assertRegionAvailable(service, definition, region, options);
   const template = selectTemplate(definition, flags.template);
   const {
     maps,
@@ -835,6 +857,19 @@ async function priceGroup({
       continue;
     }
     const subDefinition = await loadDefinition(subService, options);
+    const unavailable = await assertRegionAvailable(
+      subService,
+      subDefinition,
+      region,
+      options,
+      { explicit: flags.subservice?.length > 0 },
+    );
+    if (unavailable) {
+      warnings.push(
+        `${code} is not offered in ${region}; skipped (${unavailable.available.slice(0, 5).join(", ")})`,
+      );
+      continue;
+    }
     const templates = (subDefinition.templates ?? []).filter(
       (item) => item?.id,
     );
@@ -882,8 +917,15 @@ async function priceGroup({
       currency,
       unsupportedMappings,
     });
-    engine.resolveInputs(scoped);
-    const result = engine.evaluate();
+    let result;
+    try {
+      engine.resolveInputs(scoped);
+      result = engine.evaluate();
+    } catch (error) {
+      if (flags.subservice?.length > 0) throw error;
+      warnings.push(`${code}: ${error.message}; skipped`);
+      continue;
+    }
     collected.push({
       code,
       name: subDefinition.serviceName ?? subService.name,

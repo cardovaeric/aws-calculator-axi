@@ -1,7 +1,7 @@
 import { AxiError } from "axi-sdk-js";
 
 import { fetchJson } from "./http.js";
-import { regionName } from "./regions.js";
+import { parentRegion, regionName } from "./regions.js";
 
 const PRICING_BASE = "https://calculator.aws/";
 
@@ -34,6 +34,8 @@ export async function loadPricingMaps(
   { region, currency = "USD", ...fetchOptions } = {},
 ) {
   const display = regionName(region) ?? region;
+  const parent = parentRegion(region);
+  const parentDisplay = parent ? regionName(parent) : null;
   const maps = new Map();
   const warnings = [];
   const unsupportedMappings = new Set();
@@ -74,8 +76,13 @@ export async function loadPricingMaps(
         for (const key of ["", "Any", "Global", "All other regions"]) {
           if (data.regions[key]) Object.assign(nonRegional, data.regions[key]);
         }
+        // Local/Wavelength zones often reuse their parent region's prices.
+        const parentPrices = parentDisplay
+          ? data.regions[parentDisplay]
+          : undefined;
         pricingData = {
           ...nonRegional,
+          ...(parentPrices ?? {}),
           ...(data.regions[display] ?? {}),
         };
         if (Object.keys(pricingData).length === 0) pricingData = undefined;

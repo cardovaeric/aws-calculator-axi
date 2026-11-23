@@ -181,10 +181,51 @@ export async function loadDefinition(service, options = {}) {
   });
 }
 
-export function serviceRegions(service, definition) {
-  const codes = new Set(definition?.regions?.length ? definition.regions : service.regions);
-  return [...codes]
-    .filter((code) => REGION_NAMES[code])
-    .map((code) => ({ code, name: REGION_NAMES[code] }))
-    .sort((a, b) => a.code.localeCompare(b.code));
+export async function loadRegionList(service, options = {}) {
+  if (!service?.definitionUrl) return null;
+  const url = service.definitionUrl.replace(
+    /\/en_US\.json$/,
+    "/regionList/publish.json",
+  );
+  try {
+    return await fetchJson(url, {
+      ttlMs: 6 * 60 * 60 * 1000,
+      ...options,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Region codes the calculator actually offers for a service.
+ * An empty result means the service publishes no restriction (global).
+ */
+export function effectiveRegions(service, definition, regionList) {
+  const included = new Set([
+    ...(regionList?.inclusionList ?? []),
+    ...(regionList?.overwriteInclusionList ?? []),
+  ]);
+  for (const region of [
+    ...(regionList?.exclusionList ?? []),
+    ...(regionList?.overwriteExclusionList ?? []),
+  ]) {
+    included.delete(region);
+  }
+  if (included.size === 0) {
+    const fallback = definition?.regions?.length
+      ? definition.regions
+      : service?.regions ?? [];
+    for (const region of fallback) included.add(region);
+  }
+  return [...included]
+    .filter((code) => code !== "allRegions" && REGION_NAMES[code])
+    .sort();
+}
+
+export function serviceRegions(service, definition, regionList) {
+  return effectiveRegions(service, definition, regionList).map((code) => ({
+    code,
+    name: REGION_NAMES[code],
+  }));
 }

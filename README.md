@@ -129,21 +129,32 @@ Validated by publishing an estimate and comparing the stored total with the calc
 | API Gateway | 10M REST requests | `$49.60/mo` |
 | EBS | 100 GB gp3 + default snapshots | `$19.49/mo` |
 
-## Supported services
+## Coverage
 
-Anything whose definition uses the supported calculator widgets:
+The calculator publishes 441 service definitions. `awscalc` can price:
 
-- maths: `basicMaths`, `tieredPricingMath`, `rounding`, `maxMin`, `variable`, `snapShotMaths`
-- pricing: `singlePricePoint`, `tieredPricing`, `pricingComboV2`, `replace`, `concatenate`
-- inputs: numeric, dropdown, frequency, file size, duration, percent, throughput, utilization, checkbox
+- **128 top-level services** that use standard metered-unit pricing
+- **172 of 208 sub-services** inside the 33 grouped services (S3 16/16, VPC 13/13, Backup 15/15, DynamoDB 7/8, Glue 9/9, Bedrock 13/13, Step Functions 2/2, ELB 4/4, …)
 
-That covers most of the catalog, including Lambda, S3, CloudFront, DynamoDB, EBS, EFS, ECR, API Gateway, SQS, SNS, Kinesis, CloudWatch, Route 53, EventBridge, KMS, Secrets Manager, ELB, NAT Gateway, VPC endpoints, Fargate, EKS, CodeBuild, and more.
+It fails loudly with `UNSUPPORTED_SERVICE` rather than returning `0` for:
 
-**Explicitly unsupported for now** (the CLI fails with a clear message rather than returning `0`):
+- **EC2** instance/workload pricing
+- **PLC 2.0 pricing services**: RDS (MySQL/PostgreSQL/MariaDB/SQL Server/Oracle/Db2/Custom/Outposts), Aurora, ElastiCache, MemoryDB, MSK, Redshift, OpenSearch, Neptune, DocumentDB, Keyspaces, Timestream, Braket, GameLift, AppStream, CodeBuild, DMS, Direct Connect, Directory Service, FSx for Lustre, Elastic VMware, Managed Blockchain, Deadline Cloud, SimSpace Weaver, WorkSpaces, mainframe services
+- **16 special-widget services** (for example Data Transfer, Elemental MediaConvert outputs)
+- Data-transfer matrix widgets (`dataTransferV2`) are skipped with a warning; price transfer separately when needed
 
-- EC2 instance pricing and workload/instance-finder widgets
-- PLC 2.0 pricing services such as RDS, Aurora, ElastiCache, MSK, Redshift, OpenSearch, Neptune, DocumentDB, Keyspaces
-- Data-transfer matrix widgets (`dataTransferV2`) — these are skipped with a warning; price transfer separately if needed
+Run `awscalc services` for the catalog and `awscalc service <code>` for a service's supported inputs. Grouped services list their sub-services and which ones are in the calculator default.
+
+## Regions
+
+Region handling is data-driven:
+
+- 116 region codes are known, including standard regions, Local Zones, Wavelength Zones, GovCloud, ISO, and sovereign regions.
+- Each service's offered regions come from the calculator's own `regionList/publish.json`, so services are rejected in regions where the calculator does not offer them (for example CloudFront in `eu-north-1`).
+- Local/Wavelength zones use their own price entry when one exists, otherwise they fall back to the parent region's prices.
+- `awscalc regions --service <code>` shows the exact list for that service.
+
+A service or sub-service can be perfectly valid in one region and unavailable in another; the CLI checks this before computing or publishing.
 
 ## Caching
 
