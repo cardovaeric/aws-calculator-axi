@@ -7,7 +7,7 @@ what is still missing, and how each piece is validated.
 
 | Area | Covered |
 |---|---|
-| Top-level single services | **163 / 163** (Windows workloads: shared tenancy) |
+| Top-level single services | **163 / 163** (Windows workloads: shared tenancy and Dedicated Hosts) |
 | Grouped services | **33 / 33** |
 | Sub-services inside groups | **207 / 208** (WorkSpaces Personal/Core/Instances) |
 | Standard AWS regions + Local/Wavelength zones | **116 codes** |
@@ -18,22 +18,25 @@ what is still missing, and how each piece is validated.
 | EC2 workloads | Constant, daily, weekly, monthly spikes |
 | Data transfer | `dataTransferV2` inbound, intra-region, external, inter-region |
 | Database Savings Plans | RDS `additionalPricingData` |
-| WorkSpaces | Personal, Core Bundles, Core Managed Instances monthly/hourly tables |
+| WorkSpaces | Personal, Core Bundles, Core Managed Instances, Pools weekday/weekend tables |
 | `columnFormIPM` rows | Single row per table, indexed for multi-table services |
 
 Remaining gaps:
 
-1. **Windows workloads dedicated-host workflow.** The shared-tenancy workflow
-   (Windows/SQL license included or BYOL, Reserved/Savings/On-Demand, EBS) is
-   implemented. The `workflow=dedicated` branch and its upload/recommendation
-   tables are not; use EC2 `tenancy=host` for Dedicated Host pricing.
-2. **WorkSpaces Pools** usage-pattern optimizer. Personal, Core Bundles, and
-   Core Managed Instances are priceable. Thin Client and Secure Browser
-   definitions are not published by the calculator (HTTP 403).
-3. **Multi-row `columnFormIPM` tables.** One row per table; combine separate
-   estimates for multiple rows.
-4. `dataTransferV2` accelerated-transfer options are not implemented; standard
-   inbound/intra-region/external/inter-region pricing is.
+1. **Windows workloads bulk-upload host recommendation.** The
+   `workflow=dedicated` branch prices an explicit host list
+   (`--set hosts="c5:2, m5:1"`) and generates the review/cost tables. The
+   calculator's spreadsheet upload and automatic machine-spec-to-host
+   recommendation optimizer are not replicated.
+2. **WorkSpaces Pools** weekday/weekend usage math and included/BYOL user
+   license fees are implemented. Thin Client and Secure Browser definitions are
+   not published by the calculator (HTTP 403).
+3. **Multi-row `columnFormIPM` tables.** No published definition currently
+   exposes more than one row per table; unsupported table widgets still fail
+   closed.
+4. `dataTransferV2` accelerated-transfer options are not published in the
+   calculator's price maps. Passing an accelerated `optionType` fails closed
+   rather than silently using the standard rate.
 
 Known accuracy notes:
 
@@ -85,6 +88,14 @@ Validated so far:
 | Windows Workloads | m7i-flex.xlarge, SQL Std BYOL | `$300.08/mo` exact |
 | Windows Workloads | SQL Standard license included | `$650.48/mo` exact |
 | Windows Workloads | 3yr Convertible All Upfront | `$80/mo + $6,910` exact |
+| Windows Workloads | Dedicated Hosts c5 x2 + m5 x1 On-Demand | `$8,614.73/mo` exact |
+| Windows Workloads | Dedicated Hosts c5 x2 + m5 x1 Reserved 1yr No Upfront | `$5,427.55/mo` exact |
+| Windows Workloads | Dedicated Host c5 Reserved 3yr All Upfront | `$0/mo + $32,263` exact |
+| Windows Workloads | Dedicated Host c5 Reserved 1yr Partial Upfront | `$737.30/mo + $8,846` exact |
+| Windows Workloads | Dedicated Hosts m5 x2 Compute Savings 3yr | `$3,753.66/mo` exact |
+| Windows Workloads | Dedicated Host m5 Instance Savings 1yr | `$2,330.89/mo` exact |
+| WorkSpaces Pools | Weekday + weekend usage, 10 users, license included | `$357.71/mo` exact |
+| WorkSpaces Pools | Weekday usage, BYOL | `$218.37/mo` exact |
 | RDS MySQL | Database Savings Plan db.m7g.large | `$149.77/mo` exact |
 | RDS MySQL | Database Savings Plan db.m9g.large | `$158.53/mo` exact |
 | OpenSearch | defaults with 3 dedicated masters | `$621.96/mo` exact |
@@ -109,21 +120,21 @@ Validated so far:
 - [x] `conditionalCheckboxes`, Windows Server/SQL license selection.
 - [x] Shared-tenancy instance pricing, Savings/Reserved/On-Demand.
 - [x] EBS volumes and storage math.
-- [ ] Dedicated-host review/upload/cost tables (`workflow=dedicated`).
+- [x] Dedicated-host cost/review tables (`workflow=dedicated`) with an explicit host list.
 
 ### Phase 4 — remaining table/selector gaps
 
-- [ ] `columnFormIPM` multi-row support.
+- [ ] `columnFormIPM` multi-row support (no current definition exposes multiple rows).
 - [x] `additionalPricingData` (Database Savings Plans, Dedicated Host Savings).
 - [x] WorkSpaces monthly unit shape (Personal / Core / Managed Instances).
-- [ ] WorkSpaces Pools usage-pattern optimizer.
+- [x] WorkSpaces Pools weekday/weekend usage math and user license fees.
 - [x] `pricingStrategy`, `radioTiles`, `conditionalCheckboxes` widgets used by
   EC2 and Windows workloads.
 
 ### Phase 5 — transfer and TCO widgets
 
 - [x] `dataTransferV2` matrix (S3, EC2, CloudFront).
-- [ ] Accelerated data transfer options.
+- [x] Accelerated data transfer options fail closed (not published by the calculator).
 - [ ] Remaining `TCOCalculator` layouts.
 - [x] Browser recompute harness runs a corpus of estimates.
 

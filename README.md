@@ -138,27 +138,35 @@ Validated by publishing an estimate and comparing the stored total with the calc
 | EC2 | m5.large + 1 TB external outbound | `$162.24/mo` |
 | WorkSpaces Personal | Standard, Windows, license included | `$33/mo` |
 | Windows Workloads | m7i-flex.xlarge, SQL BYOL | `$300.08/mo` |
+| Windows Workloads | Dedicated Hosts c5 x2 + m5 x1, On-Demand | `$8,614.73/mo` |
+| Windows Workloads | Dedicated Host c5, 3yr All Upfront | `$0/mo` + `$32,263` |
+| WorkSpaces Pools | Weekday + weekend usage, 10 users | `$357.71/mo` |
 | RDS MySQL | Database Savings Plan, db.m7g.large | `$149.77/mo` |
 
 ## Coverage
 
 The calculator publishes 441 service definitions. `awscalc` can price:
 
-- **163 of 163 top-level single services** (Windows workloads: shared tenancy)
+- **163 of 163 top-level single services** (Windows workloads: shared tenancy and Dedicated Hosts)
 - **33 of 33 grouped services**, with **207 of 208 sub-services**
 - PLC 2.0 instance tables (RDS family, Aurora, ElastiCache, OpenSearch, MSK, Neptune, DocumentDB, Redshift, Keyspaces, MemoryDB, …) including **Reserved Instances** (No/Partial/All Upfront)
 - **EC2** shared/dedicated/host tenancy; On-Demand, Compute/Instance Savings Plans, Standard/Convertible Reserved Instances, Spot, and cost-optimized mixed strategies; constant and daily/weekly/monthly spike workloads; EBS, monitoring, and data transfer
 - **Dedicated Host** pricing through EC2 `tenancy=host` (host family on-demand, Reserved, and Savings Plans)
-- **Windows Server and SQL Server on EC2** shared-tenancy workflows
-- **WorkSpaces Personal, Core Bundles, and Core Managed Instances** monthly/hourly bundle tables
+- **Windows Server and SQL Server on EC2** shared-tenancy and Dedicated Host workflows
+- **WorkSpaces Personal, Core Bundles, Core Managed Instances, and Pools (weekday/weekend usage)** monthly/hourly bundle tables
 - **Database Savings Plans** for RDS via the calculator's `additionalPricingData` artifact
 - **`dataTransferV2`** inbound, intra-region, external outbound, and inter-region matrices
 
 Still missing:
 
-- Windows Server/SQL Server **dedicated-host workflow** inside the `windowsWorkloads` service (use EC2 host tenancy instead)
-- WorkSpaces **Pools** usage-pattern optimizer and WorkSpaces Thin Client/Secure Browser (the calculator does not publish those definitions)
-- Multi-row `columnFormIPM` tables (one row per table)
+- The `windowsWorkloads` **bulk-upload host recommendation optimizer**. Hosts are priced
+  from an explicit `hosts` list instead of a machine-spec spreadsheet.
+- WorkSpaces Thin Client and Secure Browser (the calculator does not publish those definitions)
+- Multi-row `columnFormIPM` tables. No published definition currently exposes more than
+  one row per table, and unsupported table widgets still fail closed.
+- Accelerated `dataTransferV2` options. The calculator's transfer price maps only publish
+  standard inbound/intra-region/outbound/inter-region rates; passing an accelerated
+  `optionType` fails closed instead of using the standard rate.
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the full status and roadmap.
 
@@ -294,7 +302,36 @@ awscalc price --service rds-mysql --region us-east-1 \
   --set deployment=Single-AZ --set instanceType=db.m7g.large
 ```
 
-Windows workloads support the shared-tenancy workflow (Windows license-included/BYOL and SQL Server Standard/Web/Enterprise BYOL or license-included), Reserved Instances, Savings Plans, On-Demand, and one machine specification with EBS volumes. The dedicated-host workflow inside `windowsWorkloads` is not implemented; price Dedicated Hosts with `--service ec2 --set tenancy=host`.
+Windows workloads support two workflows:
+
+- `workflow=shared` — Windows license-included/BYOL and SQL Server Standard/Web/Enterprise
+  BYOL or license-included, Reserved Instances, Savings Plans, On-Demand, and one machine
+  specification with EBS volumes.
+- `workflow=dedicated` — Windows Server and SQL Server BYOL on Dedicated Hosts. Pass the
+  host list explicitly; on-demand, Standard Reserved (1yr/3yr, No/Partial/All Upfront),
+  Compute Savings Plans, and Instance Savings Plans are priced from the calculator's
+  `dedicatedhost-calc` artifact.
+
+```sh
+# Dedicated Hosts: 2 x c5 and 1 x m5, On-Demand
+awscalc price --service windowsWorkloads --region us-east-2 \
+  --set workflow=dedicated --set hosts="c5:2, m5:1" \
+  --set pricingStrategy=on-demand --share
+
+# Dedicated Hosts, 3yr All Upfront Reserved
+awscalc price --service windowsWorkloads --region us-east-2 \
+  --set workflow=dedicated --set hosts="c5:1" \
+  --set pricingStrategy=reserved --set term=3yr --set upfront=AllUpfront
+
+# Dedicated Hosts, Compute Savings Plan
+awscalc price --service windowsWorkloads --region us-east-2 \
+  --set workflow=dedicated --set hosts="m5:2" \
+  --set pricingStrategy=compute-savings --set term=3yr
+```
+
+`hosts` accepts `"c5:2, m5:1"`, `"c5 x2; m5"`, a JSON array
+(`[{"hostFamily":"c5","instances":2}]`), or `hostType` + `hostCount`. The generated
+review table makes **Update estimate** recompute the same host costs.
 
 ## Regions
 

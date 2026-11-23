@@ -132,6 +132,70 @@ onDemandCost, upfrontCost, monthlyCost, instanceSavingsCost, computeSavingsCost
 
 Only the selected strategy’s path is non-zero.
 
+### Windows workloads: Dedicated Hosts
+
+`workflow=dedicated` does not use the slot-based `workloadInstanceMath`. The
+calculator sums `dhCostTableAllItems` and ignores the uploaded spreadsheet once
+the review state is saved:
+
+```json
+"workflow": { "value": "dedicated" },
+"sharedTenancy": { "value": [], "subType": "templateDynamicCards" },
+"pricingStrategyDedicatedHosts": {
+  "value": { "model": "ondemand", "term": "1 Year", "upfrontPayment": "None" }
+},
+"dhRecommendationWorkflow": { "value": {
+  "uploadedFile": null,
+  "recommendationResult": [
+    { "id": 0, "hostFamily": "c5", "description": "Host 1", "instances": 1,
+      "licenseCount": 0, "unusedVCPUs": 0, "unusedVCPUsPercentage": 100,
+      "usedVCPUs": 0, "usedCapacity": 0 }
+  ],
+  "hostToServersMapping": {}, "hostToLicensesMapping": {},
+  "machineSpecs": {}, "recommendationInProgress": false
+}},
+"dhCostTableAllItems": { "value": [ {
+  "HostFamily": "c5", "DH": "Host 1", "InstanceHourlyCost": 0,
+  "HostHourlyCost": 3.366, "HourlyCost": 3.366, "UpfrontCost": 0,
+  "MonthlyCost": 2457.18
+} ] },
+"totalMonthlyDedicatedHostsPrice": { "value": 2457.18, "subType": "dedicatedHostsMath" },
+"totalUpfrontDedicatedHostsPrice": { "value": 0, "subType": "dedicatedHostsMath" }
+```
+
+Findings:
+
+- Each `recommendationResult` entry is **one host**. `instances` counts the
+  servers placed on that host, not the number of hosts.
+- `dhCostTableAllItems` is summed per entry, so N hosts require N entries.
+- `pricingStrategyDedicatedHosts.value` uses the legacy
+  `{model, term, upfrontPayment}` shape; rehydration rebuilds the
+  `[plan, term, upfront]` `initialState` used by the cost table.
+- `sharedTenancy.value` must be an array (an empty one for dedicated) and the
+  shared `pricingStrategy`, `workloadInstanceMath`, and `workloadStorageMath`
+  components must be present, because the estimate list and config-summary
+  helper read them before branching on `workflow`.
+- `HostHourlyCost` comes from `dedicatedhost-calc` (On-Demand, Reserved, or
+  `Host/Linux/NA/<term>/<purchase>` Savings Plans). `MonthlyCost` is
+  `HostHourlyCost * 730`; Partial/All Upfront also store the raw `Quantity`
+  upfront.
+
+### WorkSpaces Pools
+
+The Pools bundle table is a `columnFormIPM` row whose `exportValueAs` includes
+non-numeric selectors (`operatingSystem`, `license`, `productFamily`). The
+calculator exposes those selected values as component variables, and the user
+license maths reads them:
+
+```json
+"Pools_userLicenseCost": { "displayIf": { "or": [ { "==": [
+  { "type": "component", "id": "license" }, "Included" ] } ] } }
+```
+
+`awscalc` therefore exports every `exportValueAs` row (numeric rows as numbers,
+dropdown/auto-suggest rows as strings). Omitting the string export drops the
+per-user license fee and understates Pools estimates.
+
 ### Workload findings
 
 Consistent workload: `totalHours = instances * 730`.

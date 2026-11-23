@@ -414,6 +414,86 @@ export function parseDataTransferEntries(value, displayRegion) {
   });
 }
 
+/**
+ * Parse a Dedicated Host list for the Windows workloads `workflow=dedicated`
+ * mode. Accepted forms:
+ *   "c5:2, m5:1"
+ *   "c5 x2; m5"
+ *   [{ "hostFamily": "c5", "instances": 2 }]
+ * Counts are host counts, not server counts.
+ */
+export function parseDedicatedHosts(value) {
+  if (value == null || value === "") return [];
+  const fromRaw = (entry) => {
+    if (typeof entry === "string") {
+      const text = entry.trim();
+      const counted = text.match(
+        /^([A-Za-z][A-Za-z0-9.-]*?)\s*(?:[:xX*]\s*|\s+)(\d+)$/,
+      );
+      const bare = text.match(/^([A-Za-z][A-Za-z0-9.-]*)$/);
+      const match = counted ?? bare;
+      if (!match) return null;
+      return { family: match[1], instances: Number(match[2] ?? 1) };
+    }
+    if (!entry || typeof entry !== "object") return null;
+    const family =
+      entry.hostFamily ??
+      entry.family ??
+      entry.hostType ??
+      entry.instanceType ??
+      entry.type;
+    if (!family) return null;
+    const count =
+      entry.instances ?? entry.hosts ?? entry.count ?? entry.quantity ?? 1;
+    return { family: String(family), instances: Number(count) };
+  };
+  let entries;
+  if (Array.isArray(value)) {
+    entries = value.map(fromRaw);
+  } else if (typeof value === "object") {
+    if (Array.isArray(value.value)) {
+      entries = value.value.map(fromRaw);
+    } else if (value.hostFamily || value.family || value.instanceType) {
+      entries = [fromRaw(value)];
+    } else {
+      entries = Object.entries(value).map(([family, count]) => ({
+        family,
+        instances: Number(count),
+      }));
+    }
+  } else {
+    const text = String(value).trim();
+    if (text.startsWith("[") || text.startsWith("{")) {
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch (error) {
+        throw new AxiError(
+          `Could not parse dedicated host JSON: ${error.message}`,
+          "VALIDATION_ERROR",
+        );
+      }
+      return parseDedicatedHosts(parsed);
+    }
+    entries = text
+      .split(/[;,\n]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map(fromRaw);
+  }
+  const hosts = entries.filter(Boolean);
+  for (const host of hosts) {
+    if (!host.family || !Number.isInteger(host.instances) || host.instances < 1) {
+      throw new AxiError(
+        `Invalid dedicated host entry "${JSON.stringify(host)}"`,
+        "VALIDATION_ERROR",
+        ['Use a host list such as --set hosts="c5:2, m5:1"'],
+      );
+    }
+  }
+  return hosts;
+}
+
 export class Engine {
   constructor({
     definition,
@@ -1526,14 +1606,25 @@ export class Engine {
       )?.prechecked ?? true,
     );
 
-    const workflow = String(take(["workflow"], "shared"));
+    const workflow = String(take(["workflow", "tenancyWorkflow"], "shared"));
+    if (workflow === "dedicated") {
+      await this.resolveWindowsDedicatedHosts({
+        take,
+        components,
+        sqlServerVersion: take(
+          ["sqlServerVersion", "machineSpecificationSQLServerVersion", "sql"],
+          null,
+        ),
+      });
+      return;
+    }
     if (workflow !== "shared") {
       throw new AxiError(
-        "Windows workload dedicated-host workflow is not supported yet",
+        `Windows workload workflow "${workflow}" is not supported`,
         "UNSUPPORTED_SERVICE",
         [
           "Use --set workflow=shared",
-          "Use the EC2 `tenancy=host` mode for dedicated host pricing",
+          "Use --set workflow=dedicated with --set hosts=\"c5:2\" for Dedicated Hosts",
         ],
       );
     }
@@ -1884,6 +1975,290 @@ export class Engine {
       id: "windowsStorage",
       label: "Storage",
       text: `Storage (${storageType}, ${storageAmount} GB)`,
+    });
+  }
+
+  /**
+   * Windows workloads on Dedicated Hosts (`workflow=dedicated`).
+   * The calculator's upload/review tables recommend hosts from machine specs;
+   * awscalc instead takes the host list explicitly and prices it with the same
+   * dedicatedhost-calc artifacts. The generated review state makes
+   * "Update estimate" recompute the same host costs.
+   */
+  async resolveWindowsDedicatedHosts({ take, components, sqlServerVersion }) {
+    const strategyText = String(
+      take(["pricingStrategy", "pricingModel"], "reserved"),
+    );
+    const strategy = normalizeEc2Strategy(strategyText);
+    if (!["standard", "on-demand", "compute-savings", "instance-savings"].includes(strategy)) {
+      throw new AxiError(
+        `Pricing strategy "${strategyText}" is not available for Dedicated Hosts`,
+        "UNSUPPORTED_SERVICE",
+        [
+          "Use --set pricingStrategy=reserved, on-demand, compute-savings, or instance-savings",
+        ],
+      );
+    }
+    const term = normalizeEc2Term(String(take(["term"], "1 Year")));
+    const purchaseOption = normalizePurchaseOption(
+      String(take(["upfront"], "No Upfront")),
+    );
+    const sqlId = String(sqlServerVersion ?? "std-byol");
+    if (/developer/i.test(sqlId)) {
+      throw new AxiError(
+        "SQL Server Developer edition is not supported by the calculator price index",
+        "UNSUPPORTED_SERVICE",
+      );
+    }
+    if (!/^no-sql$/i.test(sqlId) && !/-byol$/i.test(sqlId)) {
+      throw new AxiError(
+        "SQL Server license included is not available on Dedicated Hosts",
+        "UNSUPPORTED_SERVICE",
+        [
+          "Use a BYOL SQL Server edition (std-byol, enterprise-byol, web-byol) or no-sql",
+          "Price SQL Server license included with --set workflow=shared",
+        ],
+      );
+    }
+
+    let hosts = parseDedicatedHosts(
+      take(["hosts", "dedicatedHosts", "hostList"], null),
+    );
+    if (hosts.length === 0) {
+      const family = take(["hostType", "hostFamily"], null);
+      if (family) {
+        hosts = [
+          {
+            family: String(family),
+            instances: Math.max(1, asNumber(take(["hostCount"], 1))),
+          },
+        ];
+      }
+    }
+    if (hosts.length === 0) {
+      throw new AxiError(
+        "Dedicated Host pricing needs a host list",
+        "VALIDATION_ERROR",
+        [
+          'Pass --set hosts="c5:2, m5:1"',
+          'Or set --set hostType=c5 --set hostCount=2',
+          "Run `awscalc price --service ec2 --set tenancy=host` for a single host family",
+        ],
+      );
+    }
+
+    const hostContext = await loadEc2HostContext({
+      region: this.region,
+      currency: this.currency,
+      ...this.fetchOptions,
+    });
+    const display = hostContext.display;
+    const rateCache = new Map();
+    const rateFor = async (family) => {
+      if (rateCache.has(family)) return rateCache.get(family);
+      let rate;
+      if (strategy === "on-demand") {
+        const aggregation = selectEc2HostAggregation(hostContext, {
+          instanceType: family,
+          termType: "OnDemand",
+        });
+        const { data } = await loadEc2HostIndex(
+          hostContext,
+          aggregation,
+          this.fetchOptions,
+        );
+        const price = findEc2Price(data, display, family);
+        rate = { hourly: price.hourly, upfront: 0 };
+      } else if (strategy === "standard") {
+        const aggregation = selectEc2HostAggregation(hostContext, {
+          instanceType: family,
+          termType: "Reserved",
+        });
+        const { data } = await loadEc2HostIndex(
+          hostContext,
+          aggregation,
+          this.fetchOptions,
+        );
+        const all = findEc2Price(data, display, family);
+        const picked = this.pickReservedOption(all.entries, {
+          term,
+          purchaseOption,
+          offering: "standard",
+        });
+        rate = { hourly: picked.hourly, upfront: picked.upfront };
+      } else {
+        const savingsIndex = await loadEc2SavingsIndex(
+          hostContext,
+          {
+            kind: strategy,
+            term,
+            purchaseOption,
+            os: "Linux",
+            preInstalled: "NA",
+            tenancy: "Host",
+          },
+          this.fetchOptions,
+        );
+        const hourly = extractEc2SavingsRate(savingsIndex, display, {
+          kind: strategy,
+          term,
+          purchaseOption,
+          instanceType: family,
+        });
+        if (hourly == null) {
+          throw new AxiError(
+            `No ${strategy} Savings Plan rate found for Dedicated Host ${family} in ${display}`,
+            "VALIDATION_ERROR",
+            ["Try --set pricingStrategy=on-demand"],
+          );
+        }
+        rate = { hourly, upfront: 0 };
+      }
+      rateCache.set(family, rate);
+      return rate;
+    };
+
+    const recommendation = [];
+    const costItems = [];
+    let index = 0;
+    for (const host of hosts) {
+      const rate = await rateFor(host.family);
+      for (let count = 0; count < host.instances; count += 1) {
+        index += 1;
+        const description = `Host ${index}`;
+        const monthly = rate.hourly * 730;
+        recommendation.push({
+          id: index - 1,
+          hostFamily: host.family,
+          description,
+          instances: 1,
+          licenseCount: 0,
+          unusedVCPUs: 0,
+          unusedVCPUsPercentage: 100,
+          usedVCPUs: 0,
+          usedCapacity: 0,
+        });
+        costItems.push({
+          HostFamily: host.family,
+          DH: description,
+          InstanceHourlyCost: 0,
+          HostHourlyCost: rate.hourly,
+          HourlyCost: rate.hourly,
+          UpfrontCost: rate.upfront,
+          MonthlyCost: monthly,
+        });
+      }
+    }
+    const monthly = roundHalfUp(
+      costItems.reduce((acc, item) => acc + item.MonthlyCost, 0),
+      2,
+    );
+    const upfront = roundHalfUp(
+      costItems.reduce((acc, item) => acc + item.UpfrontCost, 0),
+      2,
+    );
+    this.values.set("totalMonthlyDedicatedHostsPrice", monthly);
+    this.values.set("totalUpfrontDedicatedHostsPrice", upfront);
+    this.values.set("dedicatedHostsMath", { monthly, upfront });
+
+    const plan =
+      strategy === "on-demand"
+        ? "ondemand"
+        : strategy === "compute-savings"
+          ? "computeSavings"
+          : strategy === "instance-savings"
+            ? "instanceSavings"
+            : "reserved";
+    const termId = `${term} Year`;
+    const upfrontLegacy =
+      purchaseOption === "All Upfront"
+        ? "Full"
+        : purchaseOption === "Partial Upfront"
+          ? "Partial"
+          : "None";
+    const pricingValue = {
+      model: plan,
+      term: termId,
+      upfrontPayment: upfrontLegacy,
+    };
+    const hasSql = !/^no-sql$/i.test(sqlId);
+    const raw = {
+      sharedTenancy: {
+        value: [],
+        initialState: { value: [] },
+        subType: "templateDynamicCards",
+      },
+      workflow: { value: "dedicated" },
+      bringWindowsLicense: { value: true },
+      windowsLicenseCheckboxes: {
+        checkedStates: { bringWindowsLicense: true },
+      },
+      windowsLicensePurchaseDate: { value: "before" },
+      bringSQLLicense: { value: hasSql },
+      haveSoftwareAssurance: { value: hasSql },
+      sqlLicenseCheckboxes: {
+        checkedStates: {
+          bringSQLLicense: hasSql,
+          haveSoftwareAssurance: hasSql,
+        },
+      },
+      sqlLicensePurchaseDate: { value: hasSql ? "before" : null },
+      pricingStrategyDedicatedHosts: {
+        value: pricingValue,
+        subType: "pricingStrategy",
+      },
+      pricingStrategy: {
+        value: { model: "standard", term: "1 Year", upfrontPayment: "None" },
+      },
+      workloadInstanceMath: { value: {}, subType: "workloadInstanceMath" },
+      workloadStorageMath: { value: {}, subType: "workloadStorageMath" },
+      dhRecommendationWorkflow: {
+        value: {
+          uploadedFile: null,
+          recommendationResult: recommendation,
+          hostToServersMapping: {},
+          hostToLicensesMapping: {},
+          machineSpecs: {},
+          recommendationInProgress: false,
+        },
+        initialState: null,
+        calculationString: null,
+        configSummaryString: null,
+        subType: "workflowInstruction",
+        isInError: false,
+        userState: null,
+        conversionStrings: null,
+        touched: null,
+      },
+      dhPricingMap: { value: {} },
+      dhCostTableAllItems: { value: costItems },
+      totalMonthlyDedicatedHostsPrice: {
+        value: monthly,
+        subType: "dedicatedHostsMath",
+      },
+      totalUpfrontDedicatedHostsPrice: {
+        value: upfront,
+        subType: "dedicatedHostsMath",
+      },
+    };
+    for (const [id, value] of Object.entries(raw)) {
+      this.rawInputs.set(id, value);
+    }
+    for (const component of components) {
+      if (component.id) this.handledComponents.add(component.id);
+    }
+    const hostSummary = hosts
+      .map((host) => `${host.family} x ${host.instances}`)
+      .join(", ");
+    this.summary.push({
+      id: "windowsWorkload",
+      label: "Windows workload",
+      text: `Windows workload (Dedicated Hosts: ${hostSummary})`,
+    });
+    this.summary.push({
+      id: "dedicatedHostPricing",
+      label: "Pricing",
+      text: `Pricing (${strategy === "standard" ? "Reserved" : strategy} ${term}yr ${purchaseOption})`,
     });
   }
 
@@ -2267,12 +2642,24 @@ export class Engine {
       this.values.set(component.calculationId.countly, prices.perUnit);
     }
     for (const row of rows) {
-      if (row.type !== "textInput" && row.type !== "numericInput") continue;
       if (!row.exportValueAs) continue;
-      const value = asNumber(
-        pseudo[row.selectorId] ?? row.defaultValue ?? 0,
-      );
-      this.values.set(row.exportValueAs, value);
+      if (row.selectorId === "Number of Nodes" && row.exportValueAs === "count") {
+        this.values.set(row.exportValueAs, nodes);
+        continue;
+      }
+      const raw =
+        selected[row.selectorId] ??
+        pseudo[row.selectorId] ??
+        row.defaultValue;
+      if (raw == null || raw === "") continue;
+      if (row.type === "textInput" || row.type === "numericInput") {
+        this.values.set(row.exportValueAs, asNumber(raw));
+      } else {
+        // Dropdown and auto-suggest rows export their selected value as a
+        // string; the calculator references it from displayIf/operands by the
+        // row's exportValueAs name (for example WorkSpaces Pools `license`).
+        this.values.set(row.exportValueAs, String(raw));
+      }
     }
 
     const exported = {
@@ -2668,6 +3055,17 @@ export class Engine {
     let total = 0;
     const state = [];
     for (const entry of entries) {
+      const option = entry.optionType == null ? "" : String(entry.optionType).trim();
+      if (option && !/^(standard|default|none)$/i.test(option)) {
+        throw new AxiError(
+          `Data transfer option "${option}" is not supported`,
+          "UNSUPPORTED_SERVICE",
+          [
+            "Accelerated transfer is not published in the calculator's data transfer pricing maps",
+            "Use standard inbound, intra-region, outbound, or inter-region transfer",
+          ],
+        );
+      }
       let cost = 0;
       if (entry.entryType === "INBOUND") {
         cost = 0;

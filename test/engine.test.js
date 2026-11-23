@@ -6,6 +6,7 @@ import { AxiError } from "axi-sdk-js";
 import {
   Engine,
   parseDataTransferEntries,
+  parseDedicatedHosts,
   selectTemplate,
   supportedSurface,
 } from "../src/engine.js";
@@ -420,4 +421,55 @@ test("prices intra-region transfer in both directions", () => {
     { value: "INTRA_REGION:100GB" },
   );
   assert.equal(engine.values.get("dataTransferForEC2"), 2);
+});
+
+test("parses dedicated host lists for windows workloads", () => {
+  assert.deepEqual(parseDedicatedHosts("c5:2, m5:1"), [
+    { family: "c5", instances: 2 },
+    { family: "m5", instances: 1 },
+  ]);
+  assert.deepEqual(parseDedicatedHosts("c5 x2; m5"), [
+    { family: "c5", instances: 2 },
+    { family: "m5", instances: 1 },
+  ]);
+  assert.deepEqual(
+    parseDedicatedHosts([{ hostFamily: "c5", instances: 3 }]),
+    [{ family: "c5", instances: 3 }],
+  );
+  assert.deepEqual(parseDedicatedHosts({ c5: 2, m5: 1 }), [
+    { family: "c5", instances: 2 },
+    { family: "m5", instances: 1 },
+  ]);
+  assert.throws(
+    () => parseDedicatedHosts("c5:0"),
+    (error) => error instanceof AxiError && /Invalid dedicated host/.test(error.message),
+  );
+});
+
+test("fails closed on unpublished accelerated transfer options", () => {
+  const engine = new Engine({
+    definition: { serviceCode: "test", serviceName: "Test" },
+    template: { id: "t", cards: [] },
+    region: "us-east-1",
+    displayRegion: "US East (N. Virginia)",
+    maps: new Map(),
+    currency: "USD",
+  });
+  engine.maps.set(
+    "datatransfer-calc",
+    mapWith({ "DataTransfer External Outbound Next 10 TB": 0.09 }).get("test"),
+  );
+  assert.throws(
+    () =>
+      engine.resolveDataTransfer(
+        { id: "dataTransferForEC2", mappingDefinitionName: "datatransfer-calc" },
+        {
+          value: JSON.stringify([
+            { entryType: "OUTBOUND", value: 1, unit: "tb_month", optionType: "accelerated" },
+          ]),
+        },
+      ),
+    (error) =>
+      error instanceof AxiError && error.code === "UNSUPPORTED_SERVICE",
+  );
 });
