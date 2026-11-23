@@ -1,0 +1,46 @@
+{
+  "name": "aws-calculator-axi",
+  "version": "0.1.0",
+  "description": "AWS Pricing Calculator CLI that computes live prices and publishes shareable calculator.aws estimates",
+  "scripts": {
+    "test": "node --test",
+    "test:watch": "node --test --watch"
+  },
+  "keywords": [
+    "aws",
+    "pricing",
+    "calculator",
+    "cost",
+    "estimate",
+    "cli",
+    "axi",
+    "toon"
+  ],
+  "author": {
+    "name": "Eric Cardova"
+  },
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "axi-sdk-js": "^0.1.14"
+  },
+  "bin": {
+    "awscalc": "bin/awscalc.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cardovaeric/aws-calculator-axi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cardovaeric/aws-calculator-axi/issues"
+  },
+  "homepage": "https://github.com/cardovaeric/aws-calculator-axi#readme"
+}
